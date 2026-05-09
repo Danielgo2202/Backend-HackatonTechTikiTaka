@@ -37,13 +37,13 @@ async def lifespan(app: FastAPI):
     app.state.cards_by_name = load_battlecards_index(settings)
     app.state.vectorstore = None
     try:
-        if settings.openai_api_key:
-            app.state.vectorstore = await asyncio.to_thread(build_vectorstore, settings)
-            logger.info("Chroma vectorstore ready")
-        else:
-            logger.warning("OPENAI_API_KEY missing: Chroma disabled; alias matching only")
+        app.state.vectorstore = await asyncio.to_thread(build_vectorstore, settings)
+        logger.info("Chroma vectorstore ready (Hugging Face embeddings: %s)", settings.embedding_model)
     except Exception:
-        logger.exception("Chroma init failed; continuing with alias-only matching")
+        logger.exception(
+            "Chroma init failed (delete backend/chroma_db if you switched embedding models); "
+            "continuing with alias-only matching"
+        )
     yield
 
 
@@ -70,6 +70,8 @@ async def health(request: Request) -> dict[str, Any]:
     return {
         "status": "ok",
         "chroma_ready": vs is not None,
+        "huggingface_embeddings": True,
+        "embedding_model": settings.embedding_model,
         "openai_configured": bool(settings.openai_api_key),
         "deepgram_configured": bool(settings.deepgram_api_key),
         "supabase_configured": bool(settings.supabase_url and settings.supabase_key),

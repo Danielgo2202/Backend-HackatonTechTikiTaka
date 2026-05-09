@@ -1,4 +1,7 @@
-"""Application settings from environment variables."""
+"""Application settings from environment variables.
+
+`embedding_model` is the Hugging Face / Sentence Transformers model id used for Chroma (local, no API key).
+"""
 
 from functools import lru_cache
 from pathlib import Path
@@ -23,7 +26,7 @@ class Settings(BaseSettings):
     battlecards_dir: str = str(Path(__file__).resolve().parent / "battlecards")
 
     llm_model: str = "gpt-4o-mini"
-    embedding_model: str = "text-embedding-3-small"
+    embedding_model: str = "all-MiniLM-L6-v2"
 
     mock_transcription: bool = False
     mock_transcript_every_n_chunks: int = 8

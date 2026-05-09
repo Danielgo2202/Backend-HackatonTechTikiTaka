@@ -8,7 +8,7 @@ from pathlib import Path
 
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
-from langchain_openai import OpenAIEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings
 
 from config import Settings, get_settings
 
@@ -47,12 +47,9 @@ def build_vectorstore(settings: Settings | None = None) -> Chroma:
     if not battle_dir.is_dir():
         raise FileNotFoundError(f"Battlecards directory missing: {battle_dir}")
 
-    if not settings.openai_api_key:
-        raise RuntimeError("OPENAI_API_KEY is required to build Chroma embeddings")
-
-    embeddings = OpenAIEmbeddings(
-        api_key=settings.openai_api_key,
-        model=settings.embedding_model,
+    embeddings = HuggingFaceEmbeddings(
+        model_name=settings.embedding_model,
+        model_kwargs={"device": "cpu"},
     )
     persist = Path(settings.chroma_persist_dir)
     persist.mkdir(parents=True, exist_ok=True)
@@ -75,7 +72,12 @@ def build_vectorstore(settings: Settings | None = None) -> Chroma:
     if not documents:
         raise RuntimeError(f"No battlecard JSON files found in {battle_dir}")
 
-    logger.info("Indexing %d battlecards into Chroma at %s", len(documents), persist)
+    logger.info(
+        "Indexing %d battlecards into Chroma at %s (HF embeddings: %s)",
+        len(documents),
+        persist,
+        settings.embedding_model,
+    )
     vectorstore = Chroma.from_documents(
         documents=documents,
         embedding=embeddings,
