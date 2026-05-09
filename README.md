@@ -1,5 +1,4 @@
-# Backend-HackatonTechTikiTaka
-# SignalCard
+# Close Pilot
 ### Real-time Competitor Intelligence for Sales Calls
 
 > **GTM Hackathon LatAm — Bogotá, Mayo 9–10, 2025 · 48 horas**
@@ -23,9 +22,9 @@
 
 ## 1. Visión del producto
 
-### ¿Qué es SignalCard?
+### ¿Qué es Close Pilot?
 
-SignalCard es un copiloto de inteligencia competitiva en tiempo real para equipos de ventas. Escucha conversaciones activas y, en el momento exacto en que un cliente menciona a un competidor, despliega automáticamente una **battlecard contextual** con todo lo que el vendedor necesita para responder con confianza — sin pausas, sin búsquedas, sin improvisación.
+Close Pilot es un copiloto de inteligencia competitiva en tiempo real para equipos de ventas. Escucha conversaciones activas y, en el momento exacto en que un cliente menciona a un competidor, despliega automáticamente una **battlecard contextual** con todo lo que el vendedor necesita para responder con confianza — sin pausas, sin búsquedas, sin improvisación.
 
 > 🎯 **La pregunta central del hackathon**
 > *"¿Lo usaría un equipo de ventas, marketing o RevOps el lunes?"*
@@ -42,7 +41,7 @@ Durante llamadas de ventas, los vendedores enfrentan estos problemas de forma re
 
 El resultado es predecible: menor tasa de cierre, respuestas débiles, pérdida de confianza y deals perdidos.
 
-SignalCard resuelve cuatro problemas simultáneamente:
+Close Pilot resuelve cuatro problemas simultáneamente:
 - Fragmentación de contexto
 - Sobrecarga cognitiva durante la llamada
 - Pérdida de información en conversaciones críticas
@@ -58,7 +57,7 @@ SignalCard resuelve cuatro problemas simultáneamente:
 
 ## 2. Diferenciador competitivo
 
-### Por qué SignalCard gana
+### Por qué Close Pilot gana
 
 La diferencia central frente a todas las herramientas existentes es una sola palabra: **timing**.
 
@@ -66,13 +65,13 @@ La diferencia central frente a todas las herramientas existentes es una sola pal
 |---|---|---|
 | Spiky.ai | Después de que termina la llamada | El daño ya está hecho |
 | Gong | Post-llamada, análisis y coaching | No ayuda en el momento |
-| **SignalCard** | **Mientras el cliente todavía está en línea** | **El vendedor responde en el acto** |
+| **Close Pilot** | **Mientras el cliente todavía está en línea** | **El vendedor responde en el acto** |
 
 El intervalo entre detección y respuesta es de **menos de 10 segundos**. Eso no existe en ningún producto actual de LatAm.
 
 ### Criterios del hackathon — Proyección de puntaje
 
-| Criterio | Qué evalúan | Cómo lo cubre SignalCard | Score esperado |
+| Criterio | Qué evalúan | Cómo lo cubre Close Pilot | Score esperado |
 |---|---|---|---|
 | Impact | Mueve revenue directamente | Mejora win rate en llamadas activas | 5 / 5 |
 | Execution | Corre en vivo ante jueces | Demo con audio real o simulado, latencia < 10s | 5 / 5 |
@@ -86,10 +85,10 @@ El intervalo entre detección y respuesta es de **menos de 10 segundos**. Eso no
 
 ### Flujo de uso real
 
-El vendedor no cambia su flujo de trabajo. SignalCard se integra como una pestaña paralela:
+El vendedor no cambia su flujo de trabajo. Close Pilot se integra como una pestaña paralela:
 
 1. Abre Zoom o Google Meet y comienza la llamada normalmente
-2. Abre SignalCard en una pestaña del navegador al lado
+2. Abre Close Pilot en una pestaña del navegador al lado
 3. Comparte el audio de la reunión con la aplicación (`getDisplayMedia`)
 4. La app transcribe la conversación en vivo en el panel central
 5. En el momento en que el cliente menciona un competidor, la battlecard aparece automáticamente en el sidebar derecho
@@ -205,7 +204,7 @@ La interfaz es minimalista y moderna, inspirada en **Cursor, Linear, Perplexity 
 ## 6. Estructura del repositorio
 
 ```
-signalcard/
+Close Pilot/
 ├── backend/
 │   ├── main.py                  # FastAPI app + WebSocket endpoint principal
 │   ├── transcription.py         # Deepgram streaming client
@@ -360,14 +359,14 @@ Ing 3         →  BattlecardSidebar.tsx necesita el formato del evento WebSocke
 
 ### Qué incluye y qué no incluye
 
-**✅ SignalCard SÍ hace**
+**✅ Close Pilot SÍ hace**
 - Detecta eventos específicos: menciones de competidores durante llamadas en vivo
 - Muestra contexto útil y pre-cargado al instante (< 10 segundos)
 - Funciona con audio real capturado del browser o con un `.wav` pregrabado para demo
 - Es reutilizable para cualquier empresa con sus propias battlecards
 - Es rápido, preciso y estable — diseñado para no fallar en demo
 
-**❌ SignalCard NO hace**
+**❌ Close Pilot NO hace**
 - Buscar información libremente en internet durante la llamada
 - Generar respuestas largas o documentos
 - Analizar llamadas post-facto (eso ya lo hace Gong/Spiky)
@@ -390,9 +389,9 @@ Ing 3         →  BattlecardSidebar.tsx necesita el formato del evento WebSocke
 
 ## Resumen ejecutivo en una línea
 
-**SignalCard** escucha llamadas de ventas en tiempo real, detecta menciones de competidores con LangChain + ChromaDB, y muestra battlecards contextuales en menos de 10 segundos — mientras el cliente todavía está en línea.
+**Close Pilot** escucha llamadas de ventas en tiempo real, detecta menciones de competidores con LangChain + ChromaDB, y muestra battlecards contextuales en menos de 10 segundos — mientras el cliente todavía está en línea.
 
 ---
 
-*SignalCard · GTM Hackathon LatAm · Bogotá, Mayo 2025*
+*Close Pilot · GTM Hackathon LatAm · Bogotá, Mayo 2025*
 *El contexto correcto. En el momento exacto.*
