@@ -1,0 +1,16 @@
+{
+  "competitor": "Apollo",
+  "strengths": [
+    "Buena base de datos de contactos",
+    "Outbound y secuencias integradas",
+    "Precio accesible para prospección"
+  ],
+  "weaknesses": [
+    "Menos profundidad en enablement durante llamadas activas",
+    "Datos de contacto con variabilidad regional",
+    "No sustituye contexto en vivo del competidor en la conversación"
+  ],
+  "suggested_response": "Apollo ayuda a abrir puertas; SignalCard ayuda a cerrar cuando el competidor sale en la mesa.",
+  "recommended_question": "¿Dónde están perdiendo más deals hoy: en el primer contacto o en las objeciones en vivo?",
+  "key_differentiator": "Detección de competidor en la llamada + battlecard lista para responder al instante."
+}

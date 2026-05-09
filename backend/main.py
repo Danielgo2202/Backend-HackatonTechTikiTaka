@@ -1,0 +1,236 @@
+"""FastAPI app: health, WebSocket audio in, transcripts and battlecards out."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import traceback
+from contextlib import asynccontextmanager
+from typing import Any
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+
+load_dotenv()
+
+from chain import CompetitorCooldown, maybe_build_battlecard_event
+from chroma_init import build_vectorstore, load_battlecards_index
+from config import get_settings
+from schemas import BattlecardEvent, ErrorEvent, TranscriptEvent, battlecard_from_dict
+from supabase_client import fetch_active_client_context
+from transcription import (
+    DeepgramStreamSession,
+    MOCK_PHRASE,
+    use_mock_transcription,
+)
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    settings = get_settings()
+    app.state.settings = settings
+    app.state.cards_by_name = load_battlecards_index(settings)
+    app.state.vectorstore = None
+    try:
+        if settings.openai_api_key:
+            app.state.vectorstore = await asyncio.to_thread(build_vectorstore, settings)
+            logger.info("Chroma vectorstore ready")
+        else:
+            logger.warning("OPENAI_API_KEY missing: Chroma disabled; alias matching only")
+    except Exception:
+        logger.exception("Chroma init failed; continuing with alias-only matching")
+    yield
+
+
+app = FastAPI(title="SignalCard API", lifespan=lifespan)
+_settings = get_settings()
+_origins = (
+    ["*"]
+    if _settings.cors_origins.strip() == "*"
+    else [o.strip() for o in _settings.cors_origins.split(",") if o.strip()]
+)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.get("/health")
+async def health(request: Request) -> dict[str, Any]:
+    settings: Any = request.app.state.settings
+    vs = request.app.state.vectorstore
+    return {
+        "status": "ok",
+        "chroma_ready": vs is not None,
+        "openai_configured": bool(settings.openai_api_key),
+        "deepgram_configured": bool(settings.deepgram_api_key),
+        "supabase_configured": bool(settings.supabase_url and settings.supabase_key),
+        "mock_transcription": use_mock_transcription(settings),
+    }
+
+
+def _mock_battlecard_event(client_context: dict[str, Any] | None) -> BattlecardEvent:
+    raw = {
+        "key_differentiator": "Nuestro motor de automatización no cobra por acción.",
+        "suggested_response": "Muchos equipos migran desde HubSpot cuando los workflows se vuelven más complejos.",
+        "recommended_question": "¿Qué limitaciones han encontrado con HubSpot hasta ahora?",
+        "weaknesses": ["Escalabilidad limitada", "Add-ons costosos"],
+    }
+    return battlecard_from_dict(
+        competitor="HubSpot",
+        confidence=0.96,
+        raw=raw,
+        client_context=client_context,
+    )
+
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket) -> None:
+    await websocket.accept()
+    settings = websocket.app.state.settings
+    vectorstore = websocket.app.state.vectorstore
+    cards_by_name = websocket.app.state.cards_by_name
+    client_context = fetch_active_client_context(settings)
+    cooldown = CompetitorCooldown(settings.battlecard_cooldown_seconds)
+    transcript_queue: asyncio.Queue = asyncio.Queue()
+    shutdown = asyncio.Event()
+    rolling_transcript = ""
+
+    async def send_json_safe(payload: Any) -> None:
+        try:
+            if isinstance(payload, str):
+                await websocket.send_text(payload)
+            elif hasattr(payload, "model_dump_json"):
+                await websocket.send_text(payload.model_dump_json())
+            else:
+                await websocket.send_text(json.dumps(payload))
+        except Exception as e:
+            logger.debug("WebSocket send failed: %s", e)
+
+    async def pump_transcripts() -> None:
+        nonlocal rolling_transcript
+        while not shutdown.is_set():
+            try:
+                item = await asyncio.wait_for(transcript_queue.get(), timeout=0.35)
+            except asyncio.CancelledError:
+                raise
+            except asyncio.TimeoutError:
+                continue
+            text = str(item.get("text", "")).strip()
+            is_final = bool(item.get("is_final", False))
+            if not text:
+                continue
+            rolling_transcript = (rolling_transcript + " " + text).strip()
+            if len(rolling_transcript) > 4000:
+                rolling_transcript = rolling_transcript[-4000:]
+            window = rolling_transcript[-1200:] if len(rolling_transcript) > 1200 else rolling_transcript
+
+            te = TranscriptEvent(text=text, is_final=is_final)
+            await send_json_safe(te)
+
+            try:
+                event = maybe_build_battlecard_event(
+                    window,
+                    vectorstore,
+                    cards_by_name,
+                    client_context,
+                    cooldown,
+                    settings,
+                )
+                if event:
+                    await send_json_safe(event)
+            except Exception:
+                logger.exception("Battlecard pipeline error")
+                await send_json_safe(
+                    ErrorEvent(
+                        message="battlecard_pipeline_error",
+                        detail=traceback.format_exc()[-800:],
+                    )
+                )
+
+    if settings.mock_battlecard_on_connect:
+        await send_json_safe(_mock_battlecard_event(client_context))
+
+    pump_task = asyncio.create_task(pump_transcripts())
+    session: DeepgramStreamSession | None = None
+    loop = asyncio.get_running_loop()
+    chunk_count = 0
+
+    err_sent = False
+
+    def on_deepgram_error(msg: str) -> None:
+        nonlocal err_sent
+        if err_sent:
+            return
+        err_sent = True
+        asyncio.run_coroutine_threadsafe(
+            send_json_safe(ErrorEvent(message="deepgram_error", detail=msg[:500])),
+            loop,
+        )
+
+    if not use_mock_transcription(settings):
+        try:
+            session = DeepgramStreamSession(
+                settings.deepgram_api_key or "",
+                loop,
+                transcript_queue,
+                on_error=on_deepgram_error,
+            )
+            session.start()
+        except Exception as e:
+            logger.exception("Failed to start Deepgram: %s", e)
+            await send_json_safe(ErrorEvent(message="deepgram_start_failed", detail=str(e)))
+            session = None
+
+    inject_demo_transcripts = use_mock_transcription(settings) or session is None
+
+    try:
+        while True:
+            message = await websocket.receive()
+            mtype = message.get("type")
+            if mtype == "websocket.disconnect":
+                break
+            if "bytes" in message and message["bytes"] is not None:
+                data: bytes = message["bytes"]
+                if session is not None:
+                    session.send_audio(data)
+                if inject_demo_transcripts:
+                    chunk_count += 1
+                    if chunk_count % max(1, settings.mock_transcript_every_n_chunks) == 0:
+                        await transcript_queue.put({"text": MOCK_PHRASE, "is_final": True})
+            elif "text" in message and message["text"] is not None:
+                raw_txt = message["text"]
+                try:
+                    body = json.loads(raw_txt)
+                except json.JSONDecodeError:
+                    continue
+                cmd = body.get("cmd")
+                if cmd == "mock_battlecard":
+                    await send_json_safe(_mock_battlecard_event(client_context))
+                elif cmd == "ping":
+                    await send_json_safe({"type": "pong"})
+    except WebSocketDisconnect:
+        logger.info("WebSocket client disconnected")
+    finally:
+        shutdown.set()
+        pump_task.cancel()
+        try:
+            await pump_task
+        except asyncio.CancelledError:
+            pass
+        if session is not None:
+            session.stop()
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

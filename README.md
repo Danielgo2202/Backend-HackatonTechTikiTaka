@@ -373,17 +373,7 @@ Ing 3         →  BattlecardSidebar.tsx necesita el formato del evento WebSocke
 - Analizar llamadas post-facto (eso ya lo hace Gong/Spiky)
 - Integrarse con Zoom vía API oficial (fuera del scope del hackathon)
 - Resolver todos los problemas de sales enablement
-
-### Reglas de arquitectura del MVP
-
-- **No hacer:** microservicios, Kafka, Redis, queues, Kubernetes
-- **Hacer:** una app backend, una app frontend, y listo
-- **Prioridad:** que el demo no falle > que el código sea perfecto
-- **Si algo falla en vivo:** el fallback es el `.wav` pregrabado — el pipeline completo igual corre
-
-> ⚡ **Regla de oro**
-> Los jueces nunca dirán *"wow, qué arquitectura"*.
-> Dirán *"wow, eso apareció exactamente cuando el cliente mencionó HubSpot"*.
+apareció exactamente cuando el cliente mencionó HubSpot"*.
 > Eso es lo que importa.
 
 ---
@@ -396,3 +386,13 @@ Ing 3         →  BattlecardSidebar.tsx necesita el formato del evento WebSocke
 
 *SignalCard · GTM Hackathon LatAm · Bogotá, Mayo 2025*
 *El contexto correcto. En el momento exacto.*
+### Reglas de arquitectura del MVP
+
+- **No hacer:** microservicios, Kafka, Redis, queues, Kubernetes
+- **Hacer:** una app backend, una app frontend, y listo
+- **Prioridad:** que el demo no falle > que el código sea perfecto
+- **Si algo falla en vivo:** el fallback es el `.wav` pregrabado — el pipeline completo igual corre
+
+> ⚡ **Regla de oro**
+> Los jueces nunca dirán *"wow, qué arquitectura"*.
+> Dirán *"wow, eso 

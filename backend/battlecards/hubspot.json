@@ -1,0 +1,15 @@
+{
+  "competitor": "HubSpot",
+  "strengths": [
+    "Mejor personalización de workflows",
+    "Menor costo para enterprise",
+    "API más flexible y extensible"
+  ],
+  "weaknesses": [
+    "Escalabilidad limitada a partir de 500 usuarios",
+    "Add-ons costosos para funciones que deberían ser básicas"
+  ],
+  "suggested_response": "Muchos equipos migran desde HubSpot cuando los workflows se vuelven más complejos. ¿Han tenido ese problema?",
+  "recommended_question": "¿Qué limitaciones han encontrado con HubSpot hasta ahora?",
+  "key_differentiator": "Nuestro motor de automatización no cobra por acción — el de HubSpot sí."
+}

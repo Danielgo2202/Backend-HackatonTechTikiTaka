@@ -1,0 +1,16 @@
+{
+  "competitor": "Gong",
+  "strengths": [
+    "Análisis post-llamada muy detallado",
+    "Fuerte en coaching de ventas",
+    "Buena adopción en enterprise"
+  ],
+  "weaknesses": [
+    "No entrega battlecards en vivo durante la llamada",
+    "Enfoque en retrospectiva, no en el momento del deal",
+    "Precio elevado para equipos pequeños"
+  ],
+  "suggested_response": "Gong es excelente para aprender después de la reunión; nosotros nos enfocamos en darte el contexto mientras el cliente sigue en línea.",
+  "recommended_question": "¿Cuántas veces en la última semana hubieran necesitado una respuesta competitiva en caliente?",
+  "key_differentiator": "Inteligencia competitiva en tiempo real (<10s), no solo insights después de colgar."
+}

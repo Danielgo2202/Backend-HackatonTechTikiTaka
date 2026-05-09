@@ -1,0 +1,16 @@
+{
+  "competitor": "Salesforce",
+  "strengths": [
+    "Ecosistema AppExchange muy amplio",
+    "Marca líder en CRM enterprise",
+    "Integraciones maduras con ERP"
+  ],
+  "weaknesses": [
+    "Costo total de propiedad alto",
+    "Curva de configuración y mantenimiento",
+    "Complejidad para equipos medianos"
+  ],
+  "suggested_response": "Salesforce brilla en grandes despliegues; muchos equipos buscan algo más ágil cuando el costo y la complejidad crecen. ¿Qué tan satisfechos están con el tiempo que dedican a administración?",
+  "recommended_question": "¿Qué parte del stack de Salesforce les está generando más fricción hoy?",
+  "key_differentiator": "Implementación más rápida y costo predecible sin depender de consultores permanentes."
+}
