@@ -160,6 +160,8 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     settings,
                 )
                 if event:
+                    competitor_name = getattr(event, "competitor", "?")
+                    logger.info(f"Enviando battlecard al frontend: {competitor_name}")
                     await send_json_safe(event)
             except Exception:
                 logger.exception("Battlecard pipeline error")
@@ -177,6 +179,8 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     session: DeepgramStreamSession | None = None
     loop = asyncio.get_running_loop()
     chunk_count = 0
+    # Next binary audio frame is tagged mic | screen | mixed (see cmd audio_source).
+    next_audio_source: str = "mixed"
 
     err_sent = False
 
@@ -215,7 +219,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             if "bytes" in message and message["bytes"] is not None:
                 data: bytes = message["bytes"]
                 if session is not None:
-                    session.send_audio(data)
+                    session.send_audio(data, source=next_audio_source)  # type: ignore[arg-type]
                 if inject_demo_transcripts:
                     chunk_count += 1
                     if chunk_count % max(1, settings.mock_transcript_every_n_chunks) == 0:
@@ -231,6 +235,9 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     await send_json_safe(_mock_battlecard_event(client_context))
                 elif cmd == "ping":
                     await send_json_safe({"type": "pong"})
+                elif cmd == "audio_source":
+                    src = body.get("source", "mixed")
+                    next_audio_source = src if src in ("mic", "screen", "mixed") else "mixed"
     except WebSocketDisconnect:
         logger.info("WebSocket client disconnected")
     finally:

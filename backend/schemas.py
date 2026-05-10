@@ -54,7 +54,6 @@ def battlecard_from_dict(
         recommended_question=str(raw.get("recommended_question", "")),
         weaknesses=list(raw.get("weaknesses") or []),
     )
-    ctx = None
     if client_context:
         ctx = ClientContext(
             name=client_context.get("name"),
@@ -62,6 +61,8 @@ def battlecard_from_dict(
             deal_size=client_context.get("deal_size"),
             pain_points=client_context.get("pain_points"),
         )
+    else:
+        ctx = ClientContext()
     return BattlecardEvent(
         competitor=competitor,
         confidence=confidence,

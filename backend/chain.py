@@ -122,8 +122,11 @@ def resolve_competitor_and_doc(
 
     if rel_pairs:
         doc, score = rel_pairs[0]
-        if score < settings.min_relevance_score:
+        # Chroma cosine "relevance" can be negative with some embeddings; treat as 0 for gating.
+        effective = max(0.0, float(score))
+        if effective < settings.min_relevance_score:
             return None
+        score = effective
     else:
         try:
             dist_pairs = vectorstore.similarity_search_with_score(transcript_window, k=1)
