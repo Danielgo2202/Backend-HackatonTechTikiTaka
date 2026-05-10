@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 load_dotenv()
@@ -19,8 +19,18 @@ load_dotenv()
 from chain import CompetitorCooldown, maybe_build_battlecard_event
 from chroma_init import build_vectorstore, load_battlecards_index
 from config import get_settings
-from schemas import BattlecardEvent, ErrorEvent, TranscriptEvent, battlecard_from_dict
-from supabase_client import fetch_active_client_context
+from schemas import (
+    BattlecardEvent,
+    ClientContextEvent,
+    ErrorEvent,
+    TranscriptEvent,
+    battlecard_from_dict,
+)
+from supabase_client import (
+    fetch_active_client_context,
+    get_client_by_id,
+    search_clients_by_name,
+)
 from transcription import (
     DeepgramStreamSession,
     MOCK_PHRASE,
@@ -91,6 +101,24 @@ async def health(request: Request) -> dict[str, Any]:
     }
 
 
+@app.get("/clients/search")
+async def search_clients(
+    q: str = Query(default="", min_length=1),
+    limit: int = Query(default=5, ge=1, le=20),
+) -> dict[str, Any]:
+    try:
+        rows = search_clients_by_name(q, limit=limit, raise_on_error=True)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"clients_search_failed: {e}") from e
+    return {"items": rows}
+
+
+@app.get("/clients/{client_id}")
+async def get_client(client_id: str) -> dict[str, Any]:
+    row = get_client_by_id(client_id)
+    return {"item": row}
+
+
 def _mock_battlecard_event(client_context: dict[str, Any] | None) -> BattlecardEvent:
     raw = {
         "key_differentiator": "Nuestro motor de automatización no cobra por acción.",
@@ -150,12 +178,13 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             te = TranscriptEvent(text=text, is_final=is_final)
             await send_json_safe(te)
 
+            current_client_context = client_context
             try:
                 event = maybe_build_battlecard_event(
                     window,
                     vectorstore,
                     cards_by_name,
-                    client_context,
+                    current_client_context,
                     cooldown,
                     settings,
                 )
@@ -172,8 +201,13 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     )
                 )
 
+    async def emit_client_context() -> None:
+        await send_json_safe(ClientContextEvent(client_context=client_context))
+
     if settings.mock_battlecard_on_connect:
         await send_json_safe(_mock_battlecard_event(client_context))
+    else:
+        await emit_client_context()
 
     pump_task = asyncio.create_task(pump_transcripts())
     session: DeepgramStreamSession | None = None
@@ -238,6 +272,24 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 elif cmd == "audio_source":
                     src = body.get("source", "mixed")
                     next_audio_source = src if src in ("mic", "screen", "mixed") else "mixed"
+                elif cmd == "set_client":
+                    client_id = str(body.get("client_id") or "").strip()
+                    if not client_id:
+                        await send_json_safe(
+                            ErrorEvent(message="set_client_failed", detail="client_id_missing")
+                        )
+                        continue
+                    selected = get_client_by_id(client_id, settings)
+                    if selected is None:
+                        await send_json_safe(
+                            ErrorEvent(message="set_client_failed", detail="client_not_found")
+                        )
+                        continue
+                    client_context = selected
+                    await emit_client_context()
+                elif cmd == "clear_client":
+                    client_context = None
+                    await emit_client_context()
     except WebSocketDisconnect:
         logger.info("WebSocket client disconnected")
     finally:
