@@ -1,16 +1,48 @@
 {
   "competitor": "Salesforce",
   "strengths": [
-    "Ecosistema AppExchange muy amplio",
-    "Marca líder en CRM enterprise",
-    "Integraciones maduras con ERP"
+    "Ecosistema AppExchange con miles de integraciones",
+    "Marca líder reconocida en enterprise",
+    "Capacidades de personalización casi ilimitadas",
+    "Integraciones maduras con ERP y sistemas legacy"
   ],
   "weaknesses": [
-    "Costo total de propiedad alto",
-    "Curva de configuración y mantenimiento",
-    "Complejidad para equipos medianos"
+    "Costo total de propiedad muy alto incluyendo consultores",
+    "Implementación lenta que puede tomar meses",
+    "Curva de aprendizaje elevada para usuarios finales",
+    "Requiere administrador dedicado para mantenerlo"
   ],
-  "suggested_response": "Salesforce brilla en grandes despliegues; muchos equipos buscan algo más ágil cuando el costo y la complejidad crecen. ¿Qué tan satisfechos están con el tiempo que dedican a administración?",
-  "recommended_question": "¿Qué parte del stack de Salesforce les está generando más fricción hoy?",
-  "key_differentiator": "Implementación más rápida y costo predecible sin depender de consultores permanentes."
+  "key_differentiator": "Implementación en días, no meses. Sin consultores permanentes ni costos ocultos de configuración.",
+  "suggested_response": "Salesforce brilla en grandes despliegues, pero muchos equipos medianos terminan pagando por complejidad que no usan. ¿Cuánto están gastando en administración y consultores hoy?",
+  "recommended_question": "¿Qué parte del stack de Salesforce les está generando más fricción o costo inesperado?",
+  "metrics": {
+    "win_rate_vs_competitor": 44,
+    "avg_deal_cycle_days": 68,
+    "deals_won_last_quarter": 8,
+    "deals_lost_last_quarter": 10,
+    "risk_level": "alto",
+    "top_objection": "Costo de migración alto"
+  },
+  "chart_data": {
+    "win_loss_trend": [
+      { "month": "Ene", "won": 1, "lost": 3 },
+      { "month": "Feb", "won": 2, "lost": 2 },
+      { "month": "Mar", "won": 2, "lost": 2 },
+      { "month": "Abr", "won": 3, "lost": 2 },
+      { "month": "May", "won": 4, "lost": 1 }
+    ],
+    "feature_comparison": [
+      { "feature": "Tiempo real", "nosotros": 100, "competidor": 5 },
+      { "feature": "Precio", "nosotros": 80, "competidor": 30 },
+      { "feature": "Integración", "nosotros": 75, "competidor": 95 },
+      { "feature": "Onboarding", "nosotros": 90, "competidor": 40 },
+      { "feature": "Soporte", "nosotros": 85, "competidor": 85 }
+    ],
+    "objection_frequency": [
+      { "objection": "Costo migración", "count": 9 },
+      { "objection": "Ecosistema", "count": 7 },
+      { "objection": "Complejidad", "count": 5 },
+      { "objection": "Consultores", "count": 4 }
+    ]
+  }
 }

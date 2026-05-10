@@ -121,10 +121,14 @@ def _format_with_llm(
     msg = llm.invoke([SystemMessage(content=sys), HumanMessage(content=human)])
     content = msg.content if isinstance(msg.content, str) else str(msg.content)
     try:
-        return _extract_json_object(content)
+        llm_out = _extract_json_object(content)
     except (json.JSONDecodeError, ValueError) as e:
         logger.warning("LLM JSON parse failed, using raw card: %s", e)
         return card
+    # LLM solo regenera campos de texto (key_differentiator, suggested_response,
+    # recommended_question, weaknesses). Preservamos metrics / chart_data / strengths
+    # del card original — el FE los necesita para pintar pills + Recharts.
+    return {**card, **llm_out}
 
 
 def resolve_competitor_and_doc(
@@ -142,14 +146,17 @@ def resolve_competitor_and_doc(
     kw_name = _keyword_match_layer1(transcript_window)
     if kw_name:
         logger.info(f"Competidor detectado por keyword: {kw_name}")
-        card: dict[str, Any] | None = None
-        if vectorstore is not None:
+        # Preferimos el índice en memoria: se carga desde disco al arrancar y
+        # SIEMPRE refleja el JSON actual de battlecards/. Chroma persiste
+        # `card_json` en disco y queda obsoleto si editamos un JSON sin borrar
+        # backend/chroma_db/, lo cual hacía que llegaran cards sin metrics /
+        # chart_data al frontend aun teniendo el JSON enriquecido.
+        card: dict[str, Any] | None = cards_by_name.get(kw_name)
+        if card is None and vectorstore is not None:
             card = _card_from_chroma_metadata_filter(vectorstore, kw_name)
-        if card is None:
-            card = cards_by_name.get(kw_name)
         if card:
             return kw_name, 1.0, card
-        logger.debug("Keyword %s sin battlecard en Chroma ni índice local", kw_name)
+        logger.debug("Keyword %s sin battlecard en índice local ni Chroma", kw_name)
         return None
 
     # --- Capa 3: similarity solo si no hubo keyword ---

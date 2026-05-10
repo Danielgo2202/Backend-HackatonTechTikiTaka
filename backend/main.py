@@ -125,6 +125,35 @@ def _mock_battlecard_event(client_context: dict[str, Any] | None) -> BattlecardE
         "suggested_response": "Muchos equipos migran desde HubSpot cuando los workflows se vuelven más complejos.",
         "recommended_question": "¿Qué limitaciones han encontrado con HubSpot hasta ahora?",
         "weaknesses": ["Escalabilidad limitada", "Add-ons costosos"],
+        "strengths": ["Personalización de workflows", "API flexible"],
+        "metrics": {
+            "win_rate_vs_competitor": 58,
+            "avg_deal_cycle_days": 42,
+            "deals_won_last_quarter": 12,
+            "deals_lost_last_quarter": 7,
+            "risk_level": "medio",
+            "top_objection": "Add-ons costosos",
+        },
+        "chart_data": {
+            "win_loss_trend": [
+                {"month": "Ene", "won": 2, "lost": 2},
+                {"month": "Feb", "won": 3, "lost": 1},
+                {"month": "Mar", "won": 3, "lost": 2},
+                {"month": "Abr", "won": 4, "lost": 1},
+                {"month": "May", "won": 5, "lost": 1},
+            ],
+            "feature_comparison": [
+                {"feature": "Tiempo real", "nosotros": 100, "competidor": 20},
+                {"feature": "Precio", "nosotros": 85, "competidor": 60},
+                {"feature": "Workflows", "nosotros": 90, "competidor": 80},
+                {"feature": "Onboarding", "nosotros": 95, "competidor": 70},
+            ],
+            "objection_frequency": [
+                {"objection": "Add-ons costosos", "count": 8},
+                {"objection": "Escalabilidad", "count": 5},
+                {"objection": "Reporting", "count": 3},
+            ],
+        },
     }
     return battlecard_from_dict(
         competitor="HubSpot",
@@ -151,7 +180,11 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             if isinstance(payload, str):
                 await websocket.send_text(payload)
             elif hasattr(payload, "model_dump_json"):
-                await websocket.send_text(payload.model_dump_json())
+                # exclude_none mantiene el JSON limpio: el FE fusiona raíz + data
+                # y trata claves ausentes como "no enriquecido". Mandar null para
+                # metrics / chart_data en cards básicas (apollo, gong, hubspot)
+                # confunde esa heurística.
+                await websocket.send_text(payload.model_dump_json(exclude_none=True))
             else:
                 await websocket.send_text(json.dumps(payload))
         except Exception as e:

@@ -12,5 +12,35 @@
   ],
   "suggested_response": "Gong es excelente para aprender después de la reunión; nosotros nos enfocamos en darte el contexto mientras el cliente sigue en línea.",
   "recommended_question": "¿Cuántas veces en la última semana hubieran necesitado una respuesta competitiva en caliente?",
-  "key_differentiator": "Inteligencia competitiva en tiempo real (<10s), no solo insights después de colgar."
+  "key_differentiator": "Inteligencia competitiva en tiempo real (<10s), no solo insights después de colgar.",
+  "metrics": {
+    "win_rate_vs_competitor": 38,
+    "avg_deal_cycle_days": 74,
+    "deals_won_last_quarter": 6,
+    "deals_lost_last_quarter": 11,
+    "risk_level": "alto",
+    "top_objection": "Ya tenemos Gong contratado"
+  },
+  "chart_data": {
+    "win_loss_trend": [
+      { "month": "Ene", "won": 1, "lost": 3 },
+      { "month": "Feb", "won": 1, "lost": 2 },
+      { "month": "Mar", "won": 2, "lost": 2 },
+      { "month": "Abr", "won": 2, "lost": 2 },
+      { "month": "May", "won": 3, "lost": 2 }
+    ],
+    "feature_comparison": [
+      { "feature": "Battlecard en vivo", "nosotros": 100, "competidor": 5 },
+      { "feature": "Análisis post-llamada", "nosotros": 60, "competidor": 95 },
+      { "feature": "Coaching", "nosotros": 70, "competidor": 90 },
+      { "feature": "Adopción enterprise", "nosotros": 55, "competidor": 90 },
+      { "feature": "Precio", "nosotros": 85, "competidor": 40 }
+    ],
+    "objection_frequency": [
+      { "objection": "Marca consolidada", "count": 9 },
+      { "objection": "Contrato vigente", "count": 7 },
+      { "objection": "Profundidad de coaching", "count": 5 },
+      { "objection": "Integraciones existentes", "count": 4 }
+    ]
+  }
 }
