@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import traceback
+import uuid
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -96,6 +97,7 @@ async def health(request: Request) -> dict[str, Any]:
         "embedding_model": settings.embedding_model,
         "openai_configured": bool(settings.openai_api_key),
         "deepgram_configured": bool(settings.deepgram_api_key),
+        "deepgram_model": settings.deepgram_model,
         "supabase_configured": bool(settings.supabase_url and settings.supabase_key),
         "mock_transcription": use_mock_transcription(settings),
     }
@@ -174,6 +176,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     transcript_queue: asyncio.Queue = asyncio.Queue()
     shutdown = asyncio.Event()
     rolling_transcript = ""
+    utterance_id = str(uuid.uuid4())
 
     async def send_json_safe(payload: Any) -> None:
         try:
@@ -191,7 +194,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             logger.debug("WebSocket send failed: %s", e)
 
     async def pump_transcripts() -> None:
-        nonlocal rolling_transcript
+        nonlocal rolling_transcript, utterance_id
         while not shutdown.is_set():
             try:
                 item = await asyncio.wait_for(transcript_queue.get(), timeout=0.35)
@@ -208,8 +211,10 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 rolling_transcript = rolling_transcript[-4000:]
             window = rolling_transcript[-1200:] if len(rolling_transcript) > 1200 else rolling_transcript
 
-            te = TranscriptEvent(text=text, is_final=is_final)
+            te = TranscriptEvent(id=utterance_id, text=text, is_final=is_final)
             await send_json_safe(te)
+            if is_final:
+                utterance_id = str(uuid.uuid4())
 
             current_client_context = client_context
             try:
