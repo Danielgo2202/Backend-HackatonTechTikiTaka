@@ -13,10 +13,12 @@ class BattlecardData(BaseModel):
 
 
 class ClientContext(BaseModel):
+    id: str | None = None
     name: str | None = None
     industry: str | None = None
     deal_size: str | None = None
-    pain_points: list[str] | None = None
+    pain_points: list[str] = Field(default_factory=list)
+    active: bool | None = None
 
 
 class BattlecardEvent(BaseModel):
@@ -42,6 +44,11 @@ class ErrorEvent(BaseModel):
     detail: str | None = None
 
 
+class ClientContextEvent(BaseModel):
+    type: str = "client_context"
+    client_context: ClientContext | None = None
+
+
 def battlecard_from_dict(
     competitor: str,
     confidence: float,
@@ -54,15 +61,18 @@ def battlecard_from_dict(
         recommended_question=str(raw.get("recommended_question", "")),
         weaknesses=list(raw.get("weaknesses") or []),
     )
-    if client_context:
-        ctx = ClientContext(
+    ctx = (
+        ClientContext(
+            id=client_context.get("id"),
             name=client_context.get("name"),
             industry=client_context.get("industry"),
             deal_size=client_context.get("deal_size"),
-            pain_points=client_context.get("pain_points"),
+            pain_points=list(client_context.get("pain_points") or []),
+            active=client_context.get("active"),
         )
-    else:
-        ctx = ClientContext()
+        if client_context
+        else None
+    )
     return BattlecardEvent(
         competitor=competitor,
         confidence=confidence,
