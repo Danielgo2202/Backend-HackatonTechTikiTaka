@@ -17,13 +17,13 @@ from schemas import BattlecardEvent, battlecard_from_dict
 
 logger = logging.getLogger(__name__)
 
-# Canonical competitor name -> substrings to match in lowercased transcript (README + aliases)
-COMPETITOR_ALIASES: dict[str, list[str]] = {
-    "HubSpot": ["hubspot", "hub spot", "crm de hubspot"],
-    "Salesforce": ["salesforce", "sales force", "sfdc", "crm de salesforce"],
-    "Gong": ["gong", "gong.io", "plataforma de gong", "gong platform"],
-    "Apollo": ["apollo", "apollo.io"],
-}
+# Capa 1 — keywords estrictos (orden de aparición en texto: gana la última mención).
+_KEYWORD_RULES: list[tuple[str, list[str]]] = [
+    ("HubSpot", [r"\bhub\s+spot\b", r"\bhubspot\b"]),
+    ("Salesforce", [r"\bsales\s+force\b", r"\bsalesforce\b", r"\bsfdc\b"]),
+    ("Gong", [r"\bgong\.io\b", r"\bgong\b"]),
+    ("Apollo", [r"\bapollo\.io\b", r"\bapollo\b"]),
+]
 
 
 class CompetitorCooldown:
@@ -40,12 +40,37 @@ class CompetitorCooldown:
         return True
 
 
-def _alias_match(text_lower: str) -> tuple[str, float] | None:
-    for canonical, needles in COMPETITOR_ALIASES.items():
-        for n in needles:
-            if n in text_lower:
-                return canonical, 1.0
-    return None
+def _keyword_match_layer1(transcript: str) -> str | None:
+    """Último competidor mencionado entre los términos de Capa 1, o None."""
+    t = transcript.lower()
+    matches: list[tuple[int, str]] = []
+    for canonical, patterns in _KEYWORD_RULES:
+        for pat in patterns:
+            for m in re.finditer(pat, t):
+                matches.append((m.start(), canonical))
+    if not matches:
+        return None
+    matches.sort(key=lambda x: x[0])
+    return matches[-1][1]
+
+
+def _card_from_chroma_metadata_filter(
+    vectorstore: Chroma,
+    competitor: str,
+) -> dict[str, Any] | None:
+    """Capa 2 — sin similarity libre: lectura por metadata competitor exacto."""
+    try:
+        data = vectorstore.get(where={"competitor": competitor}, limit=1)
+        metas = data.get("metadatas") or []
+        if not metas or metas[0] is None:
+            return None
+        raw = metas[0].get("card_json")
+        if not raw:
+            return None
+        return json.loads(raw)
+    except Exception as e:
+        logger.debug("Chroma get by competitor=%s failed: %s", competitor, e)
+        return None
 
 
 def _extract_json_object(raw: str) -> dict[str, Any]:
@@ -95,17 +120,25 @@ def resolve_competitor_and_doc(
     settings: Settings,
 ) -> tuple[str, float, dict[str, Any]] | None:
     """Return (competitor, confidence, card_dict) or None."""
-    t = transcript_window.lower().strip()
+    t = transcript_window.strip()
     if not t:
         return None
 
-    alias = _alias_match(t)
-    if alias:
-        canonical, conf = alias
-        card = cards_by_name.get(canonical)
+    # --- Capa 1 + 2: keyword primero; card solo por metadata filtrado o índice JSON ---
+    kw_name = _keyword_match_layer1(transcript_window)
+    if kw_name:
+        logger.info(f"Competidor detectado por keyword: {kw_name}")
+        card: dict[str, Any] | None = None
+        if vectorstore is not None:
+            card = _card_from_chroma_metadata_filter(vectorstore, kw_name)
+        if card is None:
+            card = cards_by_name.get(kw_name)
         if card:
-            return canonical, conf, card
+            return kw_name, 1.0, card
+        logger.debug("Keyword %s sin battlecard en Chroma ni índice local", kw_name)
+        return None
 
+    # --- Capa 3: similarity solo si no hubo keyword ---
     if vectorstore is None:
         return None
 
@@ -122,7 +155,6 @@ def resolve_competitor_and_doc(
 
     if rel_pairs:
         doc, score = rel_pairs[0]
-        # Chroma cosine "relevance" can be negative with some embeddings; treat as 0 for gating.
         effective = max(0.0, float(score))
         if effective < settings.min_relevance_score:
             return None
@@ -147,6 +179,7 @@ def resolve_competitor_and_doc(
     if not raw:
         return None
     card = json.loads(raw)
+    logger.info(f"Competidor detectado por similarity: {competitor} (score: {score})")
     return competitor, float(score), card
 
 

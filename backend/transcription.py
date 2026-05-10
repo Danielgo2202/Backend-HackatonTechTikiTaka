@@ -25,6 +25,11 @@ from config import Settings, get_settings
 
 logger = logging.getLogger(__name__)
 
+_GROQ_WHISPER_PROMPT = (
+    "Conversación de ventas B2B en español. Competidores mencionados pueden ser: "
+    "HubSpot, Salesforce, Gong, Apollo."
+)
+
 _MIN_TRANSCRIBE_BYTES = 256
 _MAX_WEBM_BYTES = 24 * 1024 * 1024
 
@@ -116,7 +121,7 @@ class DeepgramStreamSession:
         self._on_error = on_error
 
         _s = get_settings()
-        self._interval_sec = max(4.0, float(_s.groq_transcribe_interval_seconds))
+        self._interval_sec = 2.0
         self._gap_sec = max(0.0, float(_s.groq_min_gap_between_calls_seconds))
         self._last_groq_at = 0.0
 
@@ -154,6 +159,7 @@ class DeepgramStreamSession:
                 model="whisper-large-v3-turbo",
                 file=bio,
                 language="es",
+                prompt=_GROQ_WHISPER_PROMPT,
             )
         except Exception as e:
             code = getattr(e, "status_code", None) or getattr(
@@ -307,5 +313,6 @@ async def whisper_transcribe_wav_bytes(api_key: str, wav_bytes: bytes) -> str:
         model="whisper-large-v3-turbo",
         file=bio,
         language="es",
+        prompt=_GROQ_WHISPER_PROMPT,
     )
     return (getattr(tr, "text", None) or "").strip()
