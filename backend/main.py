@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import traceback
 from contextlib import asynccontextmanager
 from typing import Any
@@ -32,6 +33,7 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    print("DEEPGRAM_API_KEY loaded:", bool(os.getenv("DEEPGRAM_API_KEY")))
     settings = get_settings()
     app.state.settings = settings
     app.state.cards_by_name = load_battlecards_index(settings)
@@ -61,6 +63,16 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.get("/")
+async def root() -> dict[str, Any]:
+    """Avoid 404 when opening the server URL in a browser; this API is WebSocket + JSON routes."""
+    return {
+        "service": "SignalCard API",
+        "health": "/health",
+        "websocket": "/ws",
+    }
 
 
 @app.get("/health")

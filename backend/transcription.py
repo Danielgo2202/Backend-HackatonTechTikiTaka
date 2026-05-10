@@ -9,13 +9,52 @@ import time
 from collections.abc import Callable
 from typing import Any
 
+import websockets.sync.client as websockets_sync_client
 from deepgram import DeepgramClient
 from deepgram.core.events import EventType
 from deepgram.listen.v1.types.listen_v1results import ListenV1Results
+from websockets.exceptions import InvalidStatus
 
 from config import Settings, get_settings
 
 logger = logging.getLogger(__name__)
+
+
+def _deepgram_ws_transport(url: str, headers: dict[str, str] | None) -> Any:
+    """Open WSS to Deepgram with conservative client options.
+
+    - ``proxy=None``: skip ``HTTP_PROXY`` / system proxy (broken CONNECT often yields HTTP 408).
+    - ``compression=None``: disable permessage-deflate (some filters mishandle it).
+    """
+    return websockets_sync_client.connect(
+        url,
+        additional_headers=dict(headers or {}),
+        proxy=None,
+        open_timeout=60.0,
+        compression=None,
+    )
+
+
+def _handshake_failure_message(exc: InvalidStatus) -> str:
+    """Human-readable handshake failure (Deepgram sends dg-error / body on rejects)."""
+    r = exc.response
+    dg_error = r.headers.get("dg-error")
+    dg_rid = r.headers.get("dg-request-id")
+    body = (r.body or b"")[:1200].decode("utf-8", errors="replace").strip()
+    parts: list[str] = [f"HTTP {r.status_code}"]
+    if dg_error:
+        parts.append(f"dg-error={dg_error}")
+    if dg_rid:
+        parts.append(f"dg-request-id={dg_rid}")
+    if body:
+        parts.append(f"body={body}")
+    bl = body.lower()
+    if "request time-out" in bl and "browser" in bl:
+        parts.append(
+            "hint=generic_nginx_or_proxy_page_not_deepgram"
+            " (VPN/antivirus_SSL_scan/corporate_proxy/firewall; try another network or disable HTTPS inspection)"
+        )
+    return "; ".join(parts)
 
 
 def _results_to_text(message: Any) -> tuple[str, bool] | None:
@@ -41,7 +80,10 @@ class DeepgramStreamSession:
         transcript_queue: asyncio.Queue,
         on_error: Callable[[str], None] | None = None,
     ) -> None:
-        self._client = DeepgramClient(api_key=api_key)
+        self._client = DeepgramClient(
+            api_key=api_key.strip(),
+            transport_factory=_deepgram_ws_transport,
+        )
         self._loop = loop
         self._queue = transcript_queue
         self._on_error = on_error
@@ -58,7 +100,7 @@ class DeepgramStreamSession:
     def _worker(self) -> None:
         try:
             with self._client.listen.v1.connect(
-                model="nova-2-meeting",
+                model="nova-2",
                 interim_results=True,
                 smart_format=True,
                 language="es",
@@ -80,6 +122,11 @@ class DeepgramStreamSession:
                 connection.on(EventType.MESSAGE, on_message)
                 connection.on(EventType.ERROR, on_error)
                 connection.start_listening()
+        except InvalidStatus as e:
+            msg = _handshake_failure_message(e)
+            logger.error("Deepgram WebSocket handshake rejected: %s", msg)
+            if self._on_error:
+                self._on_error(f"deepgram_handshake: {msg}")
         except Exception as e:
             logger.exception("Deepgram session failed: %s", e)
             if self._on_error:
