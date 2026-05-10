@@ -44,8 +44,18 @@ _HALLUCINATION_PHRASES: frozenset[str] = frozenset(
 )
 
 
-def _groq_api_key() -> str:
-    return (os.getenv("GROQ_API_KEY") or "").strip()
+def _groq_api_keys() -> list[str]:
+    """GROQ_API_KEY_1..3; si todas vacías, cae en GROQ_API_KEY legado."""
+    keys: list[str] = []
+    for name in ("GROQ_API_KEY_1", "GROQ_API_KEY_2", "GROQ_API_KEY_3"):
+        v = (os.getenv(name) or "").strip()
+        if v:
+            keys.append(v)
+    if not keys:
+        leg = (os.getenv("GROQ_API_KEY") or "").strip()
+        if leg:
+            keys.append(leg)
+    return keys
 
 
 def _word_count(text: str) -> int:
@@ -112,16 +122,18 @@ class DeepgramStreamSession:
         transcript_queue: asyncio.Queue,
         on_error: Callable[[str], None] | None = None,
     ) -> None:
-        key = _groq_api_key()
-        if not key:
-            raise ValueError("GROQ_API_KEY is not set")
-        self._client = Groq(api_key=key)
+        self._groq_keys = _groq_api_keys()
+        if not self._groq_keys:
+            raise ValueError("Configure GROQ_API_KEY_1.._3 or GROQ_API_KEY")
+        self._key_index = 0
+        self._client = Groq(api_key=self._groq_keys[self._key_index])
+        logger.info(f"Usando Groq key #{self._key_index + 1}")
         self._loop = loop
         self._queue = transcript_queue
         self._on_error = on_error
 
         _s = get_settings()
-        self._interval_sec = 2.0
+        self._interval_sec = 4.0
         self._gap_sec = max(0.0, float(_s.groq_min_gap_between_calls_seconds))
         self._last_groq_at = 0.0
 
@@ -151,39 +163,51 @@ class DeepgramStreamSession:
             time.sleep(self._gap_sec - elapsed)
 
     def _groq_transcribe_bytes(self, data: bytes) -> str:
-        self._respect_inter_call_gap()
-        bio = io.BytesIO(data)
-        bio.name = "audio.webm"
-        try:
-            tr = self._client.audio.transcriptions.create(
-                model="whisper-large-v3-turbo",
-                file=bio,
-                language="es",
-                prompt=_GROQ_WHISPER_PROMPT,
-            )
-        except Exception as e:
-            code = getattr(e, "status_code", None) or getattr(
-                getattr(e, "response", None), "status_code", None
-            )
-            err_txt = str(e).lower()
-            if code == 429 or "429" in err_txt or "rate limit" in err_txt:
-                logger.warning(
-                    "Groq STT limit (429 / ASPH). Subieron GROQ_TRANSCRIBE_INTERVAL_SECONDS (p. ej. 15) "
-                    "o usad un solo stream mixed; omitiendo ventana: %s",
-                    e,
+        n_keys = len(self._groq_keys)
+        for _attempt in range(n_keys):
+            self._respect_inter_call_gap()
+            bio = io.BytesIO(data)
+            bio.name = "audio.webm"
+            try:
+                tr = self._client.audio.transcriptions.create(
+                    model="whisper-large-v3-turbo",
+                    file=bio,
+                    language="es",
+                    prompt=_GROQ_WHISPER_PROMPT,
                 )
-                return ""
-            raise
-        finally:
-            self._last_groq_at = time.monotonic()
-
-        texto = (getattr(tr, "text", None) or "").strip()
-        logger.info(
-            "Groq transcript recibido: %r (%s chars)",
-            texto,
-            len(texto),
-        )
-        return texto
+                self._last_groq_at = time.monotonic()
+                texto = (getattr(tr, "text", None) or "").strip()
+                logger.info(
+                    "Groq transcript recibido: %r (%s chars)",
+                    texto,
+                    len(texto),
+                )
+                return texto
+            except Exception as e:
+                code = getattr(e, "status_code", None) or getattr(
+                    getattr(e, "response", None), "status_code", None
+                )
+                err_txt = str(e).lower()
+                is_rl = code == 429 or "429" in err_txt or "rate limit" in err_txt
+                if is_rl and n_keys > 1:
+                    siguiente = (self._key_index + 1) % n_keys
+                    logger.warning(
+                        f"Key #{self._key_index + 1} con rate limit, rotando a key #{siguiente + 1}"
+                    )
+                    self._key_index = siguiente
+                    self._client = Groq(api_key=self._groq_keys[self._key_index])
+                    logger.info(f"Usando Groq key #{self._key_index + 1}")
+                    continue
+                if is_rl:
+                    logger.warning(
+                        "Groq STT limit (429); sin más keys que rotar: %s",
+                        e,
+                    )
+                    self._last_groq_at = time.monotonic()
+                    return ""
+                logger.exception("Groq transcription failed: %s", e)
+                raise
+        return ""
 
     def _transcribe_one_track(self, tr: _WebmWindowTrack) -> str:
         with self._lock:
@@ -292,7 +316,7 @@ def use_mock_transcription(settings: Settings | None = None) -> bool:
     settings = settings or get_settings()
     if settings.mock_transcription:
         return True
-    if not _groq_api_key():
+    if not _groq_api_keys():
         return True
     return False
 
@@ -303,16 +327,39 @@ MOCK_PHRASE = (
 
 
 async def whisper_transcribe_wav_bytes(api_key: str, wav_bytes: bytes) -> str:
-    key = _groq_api_key() or api_key
-    if not key.strip():
-        return ""
-    client = Groq(api_key=key.strip())
-    bio = io.BytesIO(wav_bytes)
-    bio.name = "clip.wav"
-    tr = client.audio.transcriptions.create(
-        model="whisper-large-v3-turbo",
-        file=bio,
-        language="es",
-        prompt=_GROQ_WHISPER_PROMPT,
-    )
-    return (getattr(tr, "text", None) or "").strip()
+    keys = _groq_api_keys()
+    if not keys:
+        leg = (api_key or "").strip()
+        if not leg:
+            return ""
+        keys = [leg]
+    idx = 0
+    client = Groq(api_key=keys[idx])
+    logger.info(f"Usando Groq key #{idx + 1}")
+    for attempt in range(len(keys)):
+        bio = io.BytesIO(wav_bytes)
+        bio.name = "clip.wav"
+        try:
+            tr = client.audio.transcriptions.create(
+                model="whisper-large-v3-turbo",
+                file=bio,
+                language="es",
+                prompt=_GROQ_WHISPER_PROMPT,
+            )
+            return (getattr(tr, "text", None) or "").strip()
+        except Exception as e:
+            code = getattr(e, "status_code", None) or getattr(
+                getattr(e, "response", None), "status_code", None
+            )
+            err_txt = str(e).lower()
+            if (code == 429 or "429" in err_txt) and len(keys) > 1:
+                siguiente = (idx + 1) % len(keys)
+                logger.warning(
+                    f"Key #{idx + 1} con rate limit, rotando a key #{siguiente + 1}"
+                )
+                idx = siguiente
+                client = Groq(api_key=keys[idx])
+                logger.info(f"Usando Groq key #{idx + 1}")
+                continue
+            raise
+    return ""

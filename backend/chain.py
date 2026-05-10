@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import time
 from typing import Any
@@ -27,16 +28,29 @@ _KEYWORD_RULES: list[tuple[str, list[str]]] = [
 
 
 class CompetitorCooldown:
+    """Timestamps por competidor (memoria); se pierde al reiniciar el proceso."""
+
     def __init__(self, cooldown_seconds: float) -> None:
         self.cooldown_seconds = cooldown_seconds
-        self._last: dict[str, float] = {}
+        self._last_sent: dict[str, float] = {}
+
+    def seconds_remaining(self, competitor: str) -> int:
+        prev = self._last_sent.get(competitor)
+        if prev is None:
+            return 0
+        elapsed = time.monotonic() - prev
+        rem = self.cooldown_seconds - elapsed
+        return max(0, int(math.ceil(rem)))
+
+    def is_in_cooldown(self, competitor: str) -> bool:
+        return self.seconds_remaining(competitor) > 0
 
     def allow(self, competitor: str) -> bool:
         now = time.monotonic()
-        prev = self._last.get(competitor)
+        prev = self._last_sent.get(competitor)
         if prev is not None and (now - prev) < self.cooldown_seconds:
             return False
-        self._last[competitor] = now
+        self._last_sent[competitor] = now
         return True
 
 
@@ -192,6 +206,13 @@ def maybe_build_battlecard_event(
     settings: Settings | None = None,
 ) -> BattlecardEvent | None:
     settings = settings or get_settings()
+    tw = transcript_window.strip()
+    kw_early = _keyword_match_layer1(transcript_window) if tw else None
+    if kw_early and cooldown.is_in_cooldown(kw_early):
+        rem = cooldown.seconds_remaining(kw_early)
+        logger.info(f"Battlecard de {kw_early} ignorada — cooldown activo ({rem}s)")
+        return None
+
     resolved = resolve_competitor_and_doc(
         transcript_window, vectorstore, cards_by_name, settings
     )
@@ -199,7 +220,8 @@ def maybe_build_battlecard_event(
         return None
     competitor, confidence, card = resolved
     if not cooldown.allow(competitor):
-        logger.debug("Cooldown skip for %s", competitor)
+        rem = cooldown.seconds_remaining(competitor)
+        logger.info(f"Battlecard de {competitor} ignorada — cooldown activo ({rem}s)")
         return None
 
     formatted = _format_with_llm(card, client_context, settings)
