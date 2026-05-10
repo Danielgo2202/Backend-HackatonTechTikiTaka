@@ -5,7 +5,9 @@
 
 from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -18,6 +20,17 @@ class Settings(BaseSettings):
 
     openai_api_key: str | None = None
     deepgram_api_key: str | None = None
+    deepgram_model: str = "nova-2"
+
+    @field_validator("deepgram_model", mode="before")
+    @classmethod
+    def deepgram_model_non_empty(cls, v: Any) -> Any:
+        """Un DEEPGRAM_MODEL vacío en .env pisa el default y Deepgram devuelve HTTP 400."""
+        if v is None:
+            return "nova-2"
+        if isinstance(v, str) and not v.strip():
+            return "nova-2"
+        return v
 
     supabase_url: str | None = None
     supabase_key: str | None = None
@@ -36,10 +49,6 @@ class Settings(BaseSettings):
     # Temporal: -1.0 deja pasar cualquier score de relevance (Chroma puede ser negativo).
     min_relevance_score: float = -1.0
     max_l2_distance: float = 1.85
-
-    # Groq STT: avoid 429 — longer interval + spacing between mic+screen calls.
-    groq_transcribe_interval_seconds: float = 12.0
-    groq_min_gap_between_calls_seconds: float = 1.5
 
     cors_origins: str = "*"
 

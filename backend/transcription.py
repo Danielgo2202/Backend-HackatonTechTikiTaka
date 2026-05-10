@@ -1,37 +1,28 @@
-"""Groq Whisper sobre ventanas de WebM (no acumulativo) + opción mic/pantalla.
+"""Deepgram live streaming STT (WebM/Opus desde el browser) + modo mic/pantalla (dos streams).
 
-Groq limita por *segundos de audio por hora* (ASPH). Re-transcribir todo el archivo
-desde el inicio en cada tick agota la cuota y devuelve 429. Aquí cada intervalo solo
-se envía el audio **de esa ventana** (~N s), reutilizando el primer chunk del track
-como cabecera EBML en ventanas posteriores.
+Los chunks binarios del WebSocket se reenvían con ``send_media``. Para audio containerizado
+(WebM), no se fija ``encoding`` en ``listen.v1.connect`` para que Deepgram infiera el formato.
 """
 
 from __future__ import annotations
 
 import asyncio
-import io
 import logging
-import os
 import re
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from groq import Groq
+from deepgram import DeepgramClient
+from deepgram.core.events import EventType
+from deepgram.listen.v1.types.listen_v1results import ListenV1Results
+from deepgram.types.listen_v1response import ListenV1Response
+from websockets.exceptions import InvalidStatus
 
 from config import Settings, get_settings
 
 logger = logging.getLogger(__name__)
-
-_GROQ_WHISPER_PROMPT = (
-    "Conversación de ventas B2B en español. Competidores mencionados pueden ser: "
-    "HubSpot, Salesforce, Gong, Apollo."
-)
-
-_MIN_TRANSCRIBE_BYTES = 256
-_MAX_WEBM_BYTES = 24 * 1024 * 1024
 
 _HALLUCINATION_PHRASES: frozenset[str] = frozenset(
     {
@@ -43,19 +34,39 @@ _HALLUCINATION_PHRASES: frozenset[str] = frozenset(
     }
 )
 
+AudioSource = Literal["mixed", "mic", "screen"]
 
-def _groq_api_keys() -> list[str]:
-    """GROQ_API_KEY_1..3; si todas vacías, cae en GROQ_API_KEY legado."""
-    keys: list[str] = []
-    for name in ("GROQ_API_KEY_1", "GROQ_API_KEY_2", "GROQ_API_KEY_3"):
-        v = (os.getenv(name) or "").strip()
-        if v:
-            keys.append(v)
-    if not keys:
-        leg = (os.getenv("GROQ_API_KEY") or "").strip()
-        if leg:
-            keys.append(leg)
-    return keys
+
+def _normalize_deepgram_key(raw: str) -> str:
+    key = (raw or "").strip().strip('"').strip("'")
+    key = key.replace("\r", "").replace("\n", "").strip()
+    low = key.lower()
+    if low.startswith("bearer "):
+        key = key[7:].strip()
+        low = key.lower()
+    if low.startswith("token "):
+        key = key[6:].strip()
+    return key
+
+
+def _handshake_failure_message(exc: InvalidStatus) -> str:
+    r = exc.response
+    dg_error = r.headers.get("dg-error")
+    dg_rid = r.headers.get("dg-request-id")
+    body = (r.body or b"")[:1200].decode("utf-8", errors="replace").strip()
+    parts: list[str] = [f"HTTP {r.status_code}"]
+    if dg_error:
+        parts.append(f"dg-error={dg_error}")
+    if dg_rid:
+        parts.append(f"dg-request-id={dg_rid}")
+    if body:
+        parts.append(f"body={body}")
+    bl = body.lower()
+    if "request time-out" in bl and "browser" in bl:
+        parts.append(
+            "hint=proxy_or_ssl_inspection (VPN/antivirus/firewall; try another network)"
+        )
+    return "; ".join(parts)
 
 
 def _word_count(text: str) -> int:
@@ -76,44 +87,142 @@ def _is_spurious_transcript(text: str) -> bool:
     return False
 
 
-@dataclass
-class _WebmWindowTrack:
-    """Un track (mixed / mic / screen): ventana actual + primer chunk para prefijo EBML."""
+def _results_to_text(message: Any) -> tuple[str, bool] | None:
+    if not isinstance(message, ListenV1Results):
+        return None
+    alts = message.channel.alternatives
+    if not alts:
+        return None
+    text = (alts[0].transcript or "").strip()
+    if not text:
+        return None
+    is_final = bool(message.is_final)
+    return text, is_final
 
-    window: bytearray = field(default_factory=bytearray)
-    preamble: bytes | None = None
-    segment_idx: int = 0
 
-    def feed(self, chunk: bytes) -> None:
-        if not chunk:
+def _prerecorded_transcript(resp: ListenV1Response) -> str:
+    chans = resp.results.channels
+    if not chans:
+        return ""
+    alts = chans[0].alternatives
+    if not alts:
+        return ""
+    return (alts[0].transcript or "").strip()
+
+
+class _DeepgramStreamRunner:
+    """Un hilo por conexión live: ``start_listening`` bloquea; ``send_media`` desde otros hilos."""
+
+    def __init__(
+        self,
+        *,
+        dg_client: DeepgramClient,
+        listen_kwargs: dict[str, Any],
+        loop: asyncio.AbstractEventLoop,
+        transcript_queue: asyncio.Queue,
+        on_error: Callable[[str], None] | None,
+        name: str,
+    ) -> None:
+        self._client = dg_client
+        self._listen_kwargs = listen_kwargs
+        self._loop = loop
+        self._queue = transcript_queue
+        self._on_error = on_error
+        self._name = name
+        self._conn_holder: dict[str, Any] = {"conn": None}
+        self._thread: threading.Thread | None = None
+        self._stopped = threading.Event()
+        self._started = False
+        self._start_lock = threading.Lock()
+
+    def _emit(self, text: str, is_final: bool) -> None:
+        asyncio.run_coroutine_threadsafe(
+            self._queue.put({"text": text, "is_final": is_final}),
+            self._loop,
+        )
+
+    def _worker(self) -> None:
+        try:
+            with self._client.listen.v1.connect(**self._listen_kwargs) as connection:
+                self._conn_holder["conn"] = connection
+
+                def on_message(message: Any, **_kwargs: Any) -> None:
+                    parsed = _results_to_text(message)
+                    if not parsed:
+                        return
+                    text, is_final = parsed
+                    if _is_spurious_transcript(text):
+                        logger.debug(
+                            "Deepgram [%s] dropped spurious: %r", self._name, text[:80]
+                        )
+                        return
+                    self._emit(text, is_final)
+
+                def on_err(exc: Any, **_kwargs: Any) -> None:
+                    logger.exception("Deepgram [%s] socket error: %s", self._name, exc)
+                    if self._on_error:
+                        self._on_error(f"{self._name}: {exc!s}")
+
+                connection.on(EventType.MESSAGE, on_message)
+                connection.on(EventType.ERROR, on_err)
+                connection.start_listening()
+        except InvalidStatus as e:
+            msg = _handshake_failure_message(e)
+            logger.error("Deepgram [%s] handshake rejected: %s", self._name, msg)
+            if self._on_error:
+                self._on_error(f"deepgram_handshake [{self._name}]: {msg}")
+        except Exception as e:
+            logger.exception("Deepgram [%s] session failed: %s", self._name, e)
+            if self._on_error:
+                self._on_error(f"{self._name}: {e!s}")
+        finally:
+            self._conn_holder["conn"] = None
+
+    def start(self) -> None:
+        with self._start_lock:
+            if self._started:
+                return
+            self._started = True
+            self._thread = threading.Thread(
+                target=self._worker, name=f"deepgram-{self._name}", daemon=True
+            )
+            self._thread.start()
+            deadline = time.monotonic() + 15.0
+            while time.monotonic() < deadline:
+                if self._conn_holder["conn"] is not None:
+                    return
+                if self._stopped.is_set():
+                    return
+                time.sleep(0.05)
+            logger.warning(
+                "Deepgram [%s] connection not ready after wait; audio may drop briefly",
+                self._name,
+            )
+
+    def send(self, chunk: bytes) -> None:
+        conn = self._conn_holder["conn"]
+        if conn is None or not chunk:
             return
-        if self.preamble is None:
-            self.preamble = bytes(chunk)
-        self.window.extend(chunk)
+        try:
+            conn.send_media(chunk)
+        except Exception as e:
+            logger.warning("Deepgram [%s] send_media failed: %s", self._name, e)
 
-    def build_upload(self) -> bytes | None:
-        raw = bytes(self.window)
-        if len(raw) < _MIN_TRANSCRIBE_BYTES or len(raw) > _MAX_WEBM_BYTES:
-            return None
-        if self.segment_idx == 0:
-            return raw
-        return (self.preamble or b"") + raw
-
-    def take_and_advance(self) -> bytes | None:
-        """Copia un upload válido y vacía la ventana (siguiente intervalo empieza limpio)."""
-        up = self.build_upload()
-        if up is None:
-            return None
-        self.window.clear()
-        self.segment_idx += 1
-        return up
-
-
-AudioSource = Literal["mixed", "mic", "screen"]
+    def stop(self) -> None:
+        self._stopped.set()
+        conn = self._conn_holder["conn"]
+        if conn is not None:
+            try:
+                conn.send_close_stream()
+            except Exception as e:
+                logger.debug("send_close_stream [%s]: %s", self._name, e)
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=8.0)
+        self._conn_holder["conn"] = None
 
 
 class DeepgramStreamSession:
-    """Ventana fija por intervalo; cada POST a Groq factura solo ~N s de audio, no toda la llamada."""
+    """Streaming a Deepgram; modo split abre dos conexiones (mic + pantalla)."""
 
     def __init__(
         self,
@@ -122,201 +231,105 @@ class DeepgramStreamSession:
         transcript_queue: asyncio.Queue,
         on_error: Callable[[str], None] | None = None,
     ) -> None:
-        self._groq_keys = _groq_api_keys()
-        if not self._groq_keys:
-            raise ValueError("Configure GROQ_API_KEY_1.._3 or GROQ_API_KEY")
-        self._key_index = 0
-        self._client = Groq(api_key=self._groq_keys[self._key_index])
-        logger.info(f"Usando Groq key #{self._key_index + 1}")
+        key = _normalize_deepgram_key(api_key)
+        if not key:
+            raise ValueError("Configure DEEPGRAM_API_KEY")
+        # Cliente por defecto del SDK (mismo handshake que documentación oficial).
+        # transport_factory+custom websockets rompía el patrón ``with connect()`` en
+        # algunas versiones y puede alterar extensiones/handshake frente a Deepgram.
+        self._client = DeepgramClient(api_key=key)
         self._loop = loop
         self._queue = transcript_queue
         self._on_error = on_error
-
-        _s = get_settings()
-        self._interval_sec = 4.0
-        self._gap_sec = max(0.0, float(_s.groq_min_gap_between_calls_seconds))
-        self._last_groq_at = 0.0
-
+        self._settings = get_settings()
+        model = (self._settings.deepgram_model or "").strip() or "nova-2"
+        # Deepgram: en query string usar "true"/"false" minúsculas, no bool Python.
+        self._listen_kw: dict[str, Any] = {
+            "model": model,
+            "interim_results": "true",
+            "smart_format": "true",
+            "language": "es",
+        }
         self._mode: Literal["mixed", "split"] = "mixed"
-        self._mixed = _WebmWindowTrack()
-        self._mic = _WebmWindowTrack()
-        self._scr = _WebmWindowTrack()
-
-        self._window_start: float | None = None
         self._lock = threading.Lock()
-        self._conn_holder: dict[str, Any] = {"conn": None}
-        self._thread: threading.Thread | None = None
-        self._stopped = threading.Event()
+        self._mixed: _DeepgramStreamRunner | None = None
+        self._mic: _DeepgramStreamRunner | None = None
+        self._scr: _DeepgramStreamRunner | None = None
 
-    def _emit_transcript(self, text: str) -> None:
-        if _is_spurious_transcript(text):
-            logger.debug("Dropped spurious transcript: %r", text[:80])
-            return
-        payload = {"type": "transcript", "text": text.strip(), "is_final": True}
-        asyncio.run_coroutine_threadsafe(self._queue.put(payload), self._loop)
-
-    def _respect_inter_call_gap(self) -> None:
-        if self._gap_sec <= 0:
-            return
-        elapsed = time.monotonic() - self._last_groq_at
-        if elapsed < self._gap_sec:
-            time.sleep(self._gap_sec - elapsed)
-
-    def _groq_transcribe_bytes(self, data: bytes) -> str:
-        n_keys = len(self._groq_keys)
-        for _attempt in range(n_keys):
-            self._respect_inter_call_gap()
-            bio = io.BytesIO(data)
-            bio.name = "audio.webm"
-            try:
-                tr = self._client.audio.transcriptions.create(
-                    model="whisper-large-v3-turbo",
-                    file=bio,
-                    language="es",
-                    prompt=_GROQ_WHISPER_PROMPT,
-                )
-                self._last_groq_at = time.monotonic()
-                texto = (getattr(tr, "text", None) or "").strip()
-                logger.info(
-                    "Groq transcript recibido: %r (%s chars)",
-                    texto,
-                    len(texto),
-                )
-                return texto
-            except Exception as e:
-                code = getattr(e, "status_code", None) or getattr(
-                    getattr(e, "response", None), "status_code", None
-                )
-                err_txt = str(e).lower()
-                is_rl = code == 429 or "429" in err_txt or "rate limit" in err_txt
-                if is_rl and n_keys > 1:
-                    siguiente = (self._key_index + 1) % n_keys
-                    logger.warning(
-                        f"Key #{self._key_index + 1} con rate limit, rotando a key #{siguiente + 1}"
-                    )
-                    self._key_index = siguiente
-                    self._client = Groq(api_key=self._groq_keys[self._key_index])
-                    logger.info(f"Usando Groq key #{self._key_index + 1}")
-                    continue
-                if is_rl:
-                    logger.warning(
-                        "Groq STT limit (429); sin más keys que rotar: %s",
-                        e,
-                    )
-                    self._last_groq_at = time.monotonic()
-                    return ""
-                logger.exception("Groq transcription failed: %s", e)
-                raise
-        return ""
-
-    def _transcribe_one_track(self, tr: _WebmWindowTrack) -> str:
-        with self._lock:
-            upload = tr.take_and_advance()
-        if upload is None:
-            return ""
-        try:
-            text = self._groq_transcribe_bytes(upload)
-        except Exception as e:
-            logger.exception("Groq transcription failed: %s", e)
-            if self._on_error:
-                self._on_error(str(e))
-            return ""
-        t = (text or "").strip()
-        if not t:
-            return ""
-        if _is_spurious_transcript(t):
-            logger.info("Transcripción descartada por filtro antirruido: %r (%s chars)", t, len(t))
-            return ""
-        return t
-
-    def _transcribe_window(self) -> None:
-        with self._lock:
-            mode = self._mode
-        if mode == "mixed":
-            text = self._transcribe_one_track(self._mixed)
-            if text:
-                self._emit_transcript(text)
-            return
-        mic_txt = self._transcribe_one_track(self._mic)
-        scr_txt = self._transcribe_one_track(self._scr)
-        merged = " ".join(x for x in (mic_txt, scr_txt) if x).strip()
-        if merged and not _is_spurious_transcript(merged):
-            self._emit_transcript(merged)
-
-    def _worker(self) -> None:
-        try:
-            while not self._stopped.is_set():
-                time.sleep(0.25)
-                with self._lock:
-                    has_audio = bool(
-                        self._mixed.window or self._mic.window or self._scr.window
-                    )
-                    if not has_audio or self._window_start is None:
-                        continue
-                    if time.monotonic() - self._window_start < self._interval_sec:
-                        continue
-                    self._window_start = time.monotonic()
-                self._transcribe_window()
-        finally:
-            with self._lock:
-                mode = self._mode
-            if mode == "mixed":
-                if bytes(self._mixed.window):
-                    t = self._transcribe_one_track(self._mixed)
-                    if t:
-                        self._emit_transcript(t)
-            else:
-                if bytes(self._mic.window) or bytes(self._scr.window):
-                    mt = self._transcribe_one_track(self._mic)
-                    st = self._transcribe_one_track(self._scr)
-                    m = " ".join(x for x in (mt, st) if x).strip()
-                    if m and not _is_spurious_transcript(m):
-                        self._emit_transcript(m)
+    def _build_runner(self, name: str) -> _DeepgramStreamRunner:
+        return _DeepgramStreamRunner(
+            dg_client=self._client,
+            listen_kwargs=self._listen_kw,
+            loop=self._loop,
+            transcript_queue=self._queue,
+            on_error=self._on_error,
+            name=name,
+        )
 
     def start(self) -> None:
-        self._thread = threading.Thread(target=self._worker, name="groq-transcribe", daemon=True)
-        self._thread.start()
-        self._conn_holder["conn"] = object()
+        """Las conexiones se abren en el primer ``send_audio`` (lazy)."""
+        return
 
     def send_audio(self, chunk: bytes, source: AudioSource = "mixed") -> None:
-        if self._conn_holder["conn"] is None:
-            return
         if not chunk:
             return
         if source not in ("mixed", "mic", "screen"):
             source = "mixed"
+
+        mixed_to_stop: _DeepgramStreamRunner | None = None
         with self._lock:
-            was_empty = not (
-                self._mixed.window or self._mic.window or self._scr.window
-            )
             if source in ("mic", "screen"):
-                self._mode = "split"
-            if self._mode == "mixed":
-                self._mixed.feed(chunk)
-            elif source == "mic":
-                self._mic.feed(chunk)
-            elif source == "screen":
-                self._scr.feed(chunk)
-            else:
-                logger.debug("Ignorando mixed en modo split; usad cmd audio_source")
+                if self._mode == "mixed":
+                    self._mode = "split"
+                    mixed_to_stop = self._mixed
+                    self._mixed = None
+            elif self._mode == "split":
+                logger.debug(
+                    "Ignorando mixed en modo split; usad cmd audio_source"
+                )
                 return
-            if was_empty and (
-                self._mixed.window or self._mic.window or self._scr.window
-            ):
-                self._window_start = time.monotonic()
+
+        if mixed_to_stop is not None:
+            mixed_to_stop.stop()
+
+        if source in ("mic", "screen"):
+            runner: _DeepgramStreamRunner | None = None
+            with self._lock:
+                if source == "mic":
+                    if self._mic is None:
+                        self._mic = self._build_runner("mic")
+                    runner = self._mic
+                else:
+                    if self._scr is None:
+                        self._scr = self._build_runner("screen")
+                    runner = self._scr
+            if runner is not None:
+                runner.start()
+                runner.send(chunk)
+        else:
+            runner_m: _DeepgramStreamRunner | None = None
+            with self._lock:
+                if self._mixed is None:
+                    self._mixed = self._build_runner("mixed")
+                runner_m = self._mixed
+            if runner_m is not None:
+                runner_m.start()
+                runner_m.send(chunk)
 
     def stop(self) -> None:
-        self._stopped.set()
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=30.0)
-        self._conn_holder["conn"] = None
+        with self._lock:
+            runners = [self._mixed, self._mic, self._scr]
+            self._mixed = self._mic = self._scr = None
+        for r in runners:
+            if r is not None:
+                r.stop()
 
 
 def use_mock_transcription(settings: Settings | None = None) -> bool:
     settings = settings or get_settings()
     if settings.mock_transcription:
         return True
-    if not _groq_api_keys():
+    if not _normalize_deepgram_key(settings.deepgram_api_key or ""):
         return True
     return False
 
@@ -326,40 +339,22 @@ MOCK_PHRASE = (
 )
 
 
-async def whisper_transcribe_wav_bytes(api_key: str, wav_bytes: bytes) -> str:
-    keys = _groq_api_keys()
-    if not keys:
-        leg = (api_key or "").strip()
-        if not leg:
-            return ""
-        keys = [leg]
-    idx = 0
-    client = Groq(api_key=keys[idx])
-    logger.info(f"Usando Groq key #{idx + 1}")
-    for attempt in range(len(keys)):
-        bio = io.BytesIO(wav_bytes)
-        bio.name = "clip.wav"
-        try:
-            tr = client.audio.transcriptions.create(
-                model="whisper-large-v3-turbo",
-                file=bio,
-                language="es",
-                prompt=_GROQ_WHISPER_PROMPT,
-            )
-            return (getattr(tr, "text", None) or "").strip()
-        except Exception as e:
-            code = getattr(e, "status_code", None) or getattr(
-                getattr(e, "response", None), "status_code", None
-            )
-            err_txt = str(e).lower()
-            if (code == 429 or "429" in err_txt) and len(keys) > 1:
-                siguiente = (idx + 1) % len(keys)
-                logger.warning(
-                    f"Key #{idx + 1} con rate limit, rotando a key #{siguiente + 1}"
-                )
-                idx = siguiente
-                client = Groq(api_key=keys[idx])
-                logger.info(f"Usando Groq key #{idx + 1}")
-                continue
-            raise
+def _sync_transcribe_wav(key: str, wav_bytes: bytes) -> str:
+    settings = get_settings()
+    client = DeepgramClient(api_key=key)
+    resp = client.listen.v1.media.transcribe_file(
+        request=wav_bytes,
+        model=settings.deepgram_model,
+        language="es",
+        smart_format=True,
+    )
+    if isinstance(resp, ListenV1Response):
+        return _prerecorded_transcript(resp)
     return ""
+
+
+async def whisper_transcribe_wav_bytes(api_key: str, wav_bytes: bytes) -> str:
+    key = _normalize_deepgram_key(api_key)
+    if not key or not wav_bytes:
+        return ""
+    return await asyncio.to_thread(_sync_transcribe_wav, key, wav_bytes)

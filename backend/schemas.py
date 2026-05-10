@@ -34,6 +34,7 @@ class BattlecardEvent(BaseModel):
 
 class TranscriptEvent(BaseModel):
     type: str = "transcript"
+    id: str
     text: str
     is_final: bool = False
 
