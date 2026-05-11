@@ -51,7 +51,15 @@ class Settings(BaseSettings):
     min_relevance_score: float = -1.0
     max_l2_distance: float = 1.85
 
+    # CORS:
+    #   cors_origins: lista separada por comas con orígenes exactos, o "*" para
+    #                 cualquier origen. Importante: si es "*", allow_credentials
+    #                 se fuerza a False (CORS spec lo prohíbe combinarlos y el
+    #                 navegador rechaza la respuesta).
+    #   cors_origin_regex: regex Python que matchee orígenes (ideal para preview
+    #                      deploys de Vercel: r"https://.*\.vercel\.app$").
     cors_origins: str = "*"
+    cors_origin_regex: str | None = None
 
 
 @lru_cache

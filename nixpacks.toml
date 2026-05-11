@@ -1,0 +1,13 @@
+# Pin Python 3.11 — sentence-transformers + chromadb tienen wheels mejor probadas ahí
+# que en 3.13 (donde algunos paquetes nativos aún no publican wheels y compilan en cold start).
+
+[phases.setup]
+nixPkgs = ['python311', 'gcc']
+
+[phases.install]
+# requirements está dentro de backend/. Nixpacks por default solo busca en la raíz.
+cmds = ['python -m pip install --upgrade pip', 'pip install --no-cache-dir -r backend/requirements.txt']
+
+[start]
+# Mismo comando que railway.toml; redundante pero blinda contra builders diferentes.
+cmd = 'cd backend && uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080} --proxy-headers --forwarded-allow-ips=* --ws-ping-interval 20 --ws-ping-timeout 30 --timeout-keep-alive 65'

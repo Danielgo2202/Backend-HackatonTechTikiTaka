@@ -1,4 +1,14 @@
-"""FastAPI app: health, WebSocket audio in, transcripts and battlecards out."""
+"""FastAPI app: health, WebSocket audio in, transcripts and battlecards out.
+
+Producción (Railway / Vercel):
+  - El proceso debe arrancarse con `--proxy-headers` y `--forwarded-allow-ips=*`
+    para que FastAPI vea el `X-Forwarded-Proto: https` que añade el load balancer
+    de Railway. Sin esto, los redirects internos pueden cortar a `http://`.
+  - El healthcheck de Railway apunta a /healthz (responde 200 SIEMPRE, sin
+    tocar app.state). /health da más detalle pero puede tardar en cold start.
+  - El lifespan NO bloquea el arranque con la indexación de Chroma: lo lanza
+    en background. /ws y /health funcionan desde el segundo 1.
+"""
 
 from __future__ import annotations
 
@@ -38,61 +48,141 @@ from transcription import (
     use_mock_transcription,
 )
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 logger = logging.getLogger(__name__)
+
+
+async def _build_vectorstore_in_background(app: FastAPI) -> None:
+    """Indexa Chroma sin bloquear el arranque del server.
+
+    Cold start en Railway: descargar `all-MiniLM-L6-v2` desde HuggingFace puede
+    tardar 1-3 min. Si bloqueamos el lifespan, /ws devuelve 503 hasta que
+    termina y el FE no puede conectar. Como tenemos `cards_by_name` (índice
+    en memoria desde JSON) que cubre keyword matching, el WS funciona sin
+    Chroma — solo perdemos similarity search hasta que esté listo.
+    """
+    settings = app.state.settings
+    try:
+        app.state.vectorstore = await asyncio.to_thread(build_vectorstore, settings)
+        logger.info(
+            "Chroma vectorstore ready (HF embeddings: %s)", settings.embedding_model
+        )
+    except Exception:
+        logger.exception(
+            "Chroma init failed — continuing with in-memory cards_by_name only "
+            "(keyword matching seguirá funcionando)"
+        )
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("DEEPGRAM_API_KEY loaded:", bool(os.getenv("DEEPGRAM_API_KEY")))
     settings = get_settings()
     app.state.settings = settings
     app.state.cards_by_name = load_battlecards_index(settings)
     app.state.vectorstore = None
+    app.state.vectorstore_task = asyncio.create_task(
+        _build_vectorstore_in_background(app)
+    )
+    logger.info(
+        "App startup: deepgram=%s groq=%s supabase=%s mock_stt=%s cards=%d",
+        bool(settings.deepgram_api_key),
+        bool(settings.groq_api_key),
+        bool(settings.supabase_url and settings.supabase_key),
+        use_mock_transcription(settings),
+        len(app.state.cards_by_name),
+    )
     try:
-        app.state.vectorstore = await asyncio.to_thread(build_vectorstore, settings)
-        logger.info("Chroma vectorstore ready (Hugging Face embeddings: %s)", settings.embedding_model)
-    except Exception:
-        logger.exception(
-            "Chroma init failed (delete backend/chroma_db if you switched embedding models); "
-            "continuing with alias-only matching"
-        )
-    yield
+        yield
+    finally:
+        task = getattr(app.state, "vectorstore_task", None)
+        if task is not None and not task.done():
+            task.cancel()
 
 
 app = FastAPI(title="SignalCard API", lifespan=lifespan)
+
+# ---------------------------------------------------------------------------
+# CORS
+# ---------------------------------------------------------------------------
+# Reglas:
+#   - Si CORS_ORIGINS es "*", forzamos allow_credentials=False (CORS spec lo
+#     prohíbe combinar y los navegadores rechazan la respuesta — es la causa
+#     #1 de "WS no conecta" en producción cuando el FE manda cookies/headers).
+#   - Si necesitas credenciales, define orígenes exactos en CORS_ORIGINS y/o
+#     un patrón en CORS_ORIGIN_REGEX (ej. r"https://.*\.vercel\.app$" para
+#     cubrir todos los preview deploys).
 _settings = get_settings()
-_origins = (
-    ["*"]
-    if _settings.cors_origins.strip() == "*"
-    else [o.strip() for o in _settings.cors_origins.split(",") if o.strip()]
+_origins_raw = (_settings.cors_origins or "*").strip()
+if _origins_raw == "*":
+    _origins: list[str] = ["*"]
+    _allow_credentials = False
+else:
+    _origins = [o.strip() for o in _origins_raw.split(",") if o.strip()]
+    _allow_credentials = True
+
+_cors_kwargs: dict[str, Any] = {
+    "allow_origins": _origins,
+    "allow_credentials": _allow_credentials,
+    "allow_methods": ["*"],
+    "allow_headers": ["*"],
+    # Útil para preflight OPTIONS de Vercel preview deploys.
+    "expose_headers": ["*"],
+    "max_age": 600,
+}
+if _settings.cors_origin_regex:
+    _cors_kwargs["allow_origin_regex"] = _settings.cors_origin_regex
+
+app.add_middleware(CORSMiddleware, **_cors_kwargs)
+logger.info(
+    "CORS configurado: origins=%s regex=%s credentials=%s",
+    _origins,
+    _settings.cors_origin_regex,
+    _allow_credentials,
 )
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=_origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+
+
+# ---------------------------------------------------------------------------
+# HTTP routes
+# ---------------------------------------------------------------------------
 
 
 @app.get("/")
 async def root() -> dict[str, Any]:
-    """Avoid 404 when opening the server URL in a browser; this API is WebSocket + JSON routes."""
+    """Avoid 404 when opening the server URL in a browser."""
     return {
         "service": "SignalCard API",
         "health": "/health",
+        "healthz": "/healthz",
         "websocket": "/ws",
     }
 
 
+@app.get("/healthz")
+async def healthz() -> dict[str, str]:
+    """Healthcheck mínimo para Railway: 200 siempre, sin tocar app.state.
+
+    El lifespan tarda en cold start (descarga modelo HF). Si Railway hace ping
+    a /health antes de que termine, el container se marca como unhealthy y
+    se reinicia en un loop. /healthz responde aunque no haya nada cargado.
+    """
+    return {"status": "ok"}
+
+
 @app.get("/health")
 async def health(request: Request) -> dict[str, Any]:
-    settings: Any = request.app.state.settings
-    vs = request.app.state.vectorstore
+    """Healthcheck con detalle. Tolerante a app.state aún no inicializado."""
+    settings: Any = getattr(request.app.state, "settings", None)
+    vs = getattr(request.app.state, "vectorstore", None)
+    cards = getattr(request.app.state, "cards_by_name", None)
+    if settings is None:
+        return {"status": "starting"}
     return {
         "status": "ok",
         "chroma_ready": vs is not None,
+        "cards_loaded": len(cards or {}),
         "huggingface_embeddings": True,
         "embedding_model": settings.embedding_model,
         "groq_configured": bool(settings.groq_api_key),
@@ -165,12 +255,46 @@ def _mock_battlecard_event(client_context: dict[str, Any] | None) -> BattlecardE
     )
 
 
+def _ws_handshake_summary(websocket: WebSocket) -> dict[str, Any]:
+    """Datos útiles del handshake para diagnóstico en producción."""
+    h = websocket.headers
+    client = websocket.client
+    return {
+        "client": f"{client.host}:{client.port}" if client else "?",
+        "origin": h.get("origin"),
+        "user_agent": (h.get("user-agent") or "")[:120],
+        "x_forwarded_for": h.get("x-forwarded-for"),
+        "x_forwarded_proto": h.get("x-forwarded-proto"),
+        "host": h.get("host"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# WebSocket endpoint
+# ---------------------------------------------------------------------------
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket) -> None:
+    summary = _ws_handshake_summary(websocket)
+    logger.info("WS handshake intent: %s", summary)
     await websocket.accept()
-    settings = websocket.app.state.settings
-    vectorstore = websocket.app.state.vectorstore
-    cards_by_name = websocket.app.state.cards_by_name
+    logger.info("WS connected: client=%s origin=%s", summary["client"], summary["origin"])
+
+    # app.state puede no tener todo si el primer cliente conecta durante el cold start.
+    settings = getattr(websocket.app.state, "settings", None)
+    if settings is None:
+        logger.warning("WS rechazado: app.state.settings aún no inicializado")
+        try:
+            await websocket.send_text(
+                json.dumps({"type": "error", "message": "server_starting"})
+            )
+        finally:
+            await websocket.close(code=1013)  # Try Again Later
+        return
+
+    vectorstore = getattr(websocket.app.state, "vectorstore", None)
+    cards_by_name = getattr(websocket.app.state, "cards_by_name", {}) or {}
     client_context = fetch_active_client_context(settings)
     cooldown = CompetitorCooldown(settings.battlecard_cooldown_seconds)
     transcript_queue: asyncio.Queue = asyncio.Queue()
@@ -184,14 +308,12 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 await websocket.send_text(payload)
             elif hasattr(payload, "model_dump_json"):
                 # exclude_none mantiene el JSON limpio: el FE fusiona raíz + data
-                # y trata claves ausentes como "no enriquecido". Mandar null para
-                # metrics / chart_data en cards básicas (apollo, gong, hubspot)
-                # confunde esa heurística.
+                # y trata claves ausentes como "no enriquecido".
                 await websocket.send_text(payload.model_dump_json(exclude_none=True))
             else:
                 await websocket.send_text(json.dumps(payload))
         except Exception as e:
-            logger.debug("WebSocket send failed: %s", e)
+            logger.debug("WS send failed (cliente probablemente cerrado): %s", e)
 
     async def pump_transcripts() -> None:
         nonlocal rolling_transcript, utterance_id
@@ -218,9 +340,11 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
 
             current_client_context = client_context
             try:
+                # Re-leer vectorstore por si terminó de inicializarse durante la sesión.
+                vs_now = getattr(websocket.app.state, "vectorstore", None)
                 event = maybe_build_battlecard_event(
                     window,
-                    vectorstore,
+                    vs_now,
                     cards_by_name,
                     current_client_context,
                     cooldown,
@@ -228,7 +352,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 )
                 if event:
                     competitor_name = getattr(event, "competitor", "?")
-                    logger.info(f"Enviando battlecard al frontend: {competitor_name}")
+                    logger.info("Battlecard -> FE: %s", competitor_name)
                     await send_json_safe(event)
             except Exception:
                 logger.exception("Battlecard pipeline error")
@@ -251,9 +375,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     session: DeepgramStreamSession | None = None
     loop = asyncio.get_running_loop()
     chunk_count = 0
-    # Next binary audio frame is tagged mic | screen | mixed (see cmd audio_source).
     next_audio_source: str = "mixed"
-
     err_sent = False
 
     def on_deepgram_error(msg: str) -> None:
@@ -282,11 +404,17 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
 
     inject_demo_transcripts = use_mock_transcription(settings) or session is None
 
+    disconnect_reason = "normal"
     try:
         while True:
-            message = await websocket.receive()
+            try:
+                message = await websocket.receive()
+            except WebSocketDisconnect as e:
+                disconnect_reason = f"client_disconnect code={e.code}"
+                break
             mtype = message.get("type")
             if mtype == "websocket.disconnect":
+                disconnect_reason = "websocket.disconnect"
                 break
             if "bytes" in message and message["bytes"] is not None:
                 data: bytes = message["bytes"]
@@ -301,6 +429,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 try:
                     body = json.loads(raw_txt)
                 except json.JSONDecodeError:
+                    logger.debug("WS texto no-JSON ignorado: %r", raw_txt[:200])
                     continue
                 cmd = body.get("cmd")
                 if cmd == "mock_battlecard":
@@ -328,9 +457,17 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 elif cmd == "clear_client":
                     client_context = None
                     await emit_client_context()
-    except WebSocketDisconnect:
-        logger.info("WebSocket client disconnected")
+                else:
+                    logger.debug("WS cmd desconocido: %r", cmd)
+    except Exception:
+        disconnect_reason = "exception"
+        logger.exception("WS loop crash inesperado")
     finally:
+        logger.info(
+            "WS disconnected: client=%s reason=%s",
+            summary["client"],
+            disconnect_reason,
+        )
         shutdown.set()
         pump_task.cancel()
         try:
@@ -341,7 +478,22 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             session.stop()
 
 
+# ---------------------------------------------------------------------------
+# Entry point para desarrollo local. En producción Railway usa Procfile/railway.toml.
+# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    port = int(os.environ.get("PORT", "8000"))
+    reload_env = os.environ.get("UVICORN_RELOAD", "false").lower() in ("1", "true", "yes")
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=port,
+        reload=reload_env,
+        proxy_headers=True,
+        forwarded_allow_ips="*",
+        ws_ping_interval=20,
+        ws_ping_timeout=30,
+        timeout_keep_alive=65,
+    )
