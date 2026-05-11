@@ -95,7 +95,7 @@ async def health(request: Request) -> dict[str, Any]:
         "chroma_ready": vs is not None,
         "huggingface_embeddings": True,
         "embedding_model": settings.embedding_model,
-        "openai_configured": bool(settings.openai_api_key),
+        "groq_configured": bool(settings.groq_api_key),
         "deepgram_configured": bool(settings.deepgram_api_key),
         "deepgram_model": settings.deepgram_model,
         "supabase_configured": bool(settings.supabase_url and settings.supabase_key),
