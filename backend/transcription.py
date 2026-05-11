@@ -7,22 +7,90 @@ Los chunks binarios del WebSocket se reenvían con ``send_media``. Para audio co
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
+import queue as queue_mod
 import re
+import socket
+import ssl
+import sys
 import threading
 import time
+import traceback
 from collections.abc import Callable
+from importlib import metadata as importlib_metadata
 from typing import Any, Literal
+from urllib.parse import urlencode
 
 from deepgram import DeepgramClient
-from deepgram.core.events import EventType
-from deepgram.listen.v1.types.listen_v1results import ListenV1Results
 from deepgram.types.listen_v1response import ListenV1Response
-from websockets.exceptions import InvalidStatus
+from websockets.asyncio.client import connect as ws_async_connect
+from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 from config import Settings, get_settings
 
 logger = logging.getLogger(__name__)
+
+_DIAGNOSTICS_LOGGED = False
+
+
+def _safe_pkg_version(name: str) -> str:
+    try:
+        return importlib_metadata.version(name)
+    except Exception:
+        return "unknown"
+
+
+def _resolve_host(host: str, port: int = 443) -> str:
+    """A qué IP resuelve api.deepgram.com en esta máquina (delata DNS hijack / proxy transparente)."""
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        ips = sorted({info[4][0] for info in infos})
+        return ", ".join(ips) if ips else "<empty>"
+    except Exception as e:
+        return f"<resolve error: {e!s}>"
+
+
+def _proxy_env_snapshot() -> dict[str, str]:
+    """Variables que httpx / websockets / requests respetan para proxy."""
+    keys = (
+        "HTTP_PROXY", "http_proxy",
+        "HTTPS_PROXY", "https_proxy",
+        "ALL_PROXY", "all_proxy",
+        "NO_PROXY", "no_proxy",
+        "REQUESTS_CA_BUNDLE", "SSL_CERT_FILE", "SSL_CERT_DIR",
+        "PYTHONHTTPSVERIFY",
+    )
+    return {k: os.environ.get(k, "") for k in keys if os.environ.get(k)}
+
+
+def _log_environment_diagnostics() -> None:
+    """Vuelca UNA vez al primer arranque info útil para comparar máquinas.
+
+    Comparte la salida con un compañero al que SÍ le funciona y mira qué
+    línea difiere — normalmente: proxy env, IP resuelta, o versión de
+    websockets / deepgram-sdk.
+    """
+    global _DIAGNOSTICS_LOGGED
+    if _DIAGNOSTICS_LOGGED:
+        return
+    _DIAGNOSTICS_LOGGED = True
+
+    logger.info("===== Deepgram diag: entorno =====")
+    logger.info("python: %s", sys.version.replace("\n", " "))
+    logger.info("openssl: %s", ssl.OPENSSL_VERSION)
+    logger.info("ssl default cafile: %s", ssl.get_default_verify_paths().cafile)
+    logger.info(
+        "pkg versions: deepgram-sdk=%s websockets=%s httpx=%s",
+        _safe_pkg_version("deepgram-sdk"),
+        _safe_pkg_version("websockets"),
+        _safe_pkg_version("httpx"),
+    )
+    proxies = _proxy_env_snapshot()
+    logger.info("proxy env (vacío = sin proxy explícito): %s", proxies or "{}")
+    logger.info("DNS api.deepgram.com -> %s", _resolve_host("api.deepgram.com"))
+    logger.info("===================================")
 
 _HALLUCINATION_PHRASES: frozenset[str] = frozenset(
     {
@@ -87,19 +155,6 @@ def _is_spurious_transcript(text: str) -> bool:
     return False
 
 
-def _results_to_text(message: Any) -> tuple[str, bool] | None:
-    if not isinstance(message, ListenV1Results):
-        return None
-    alts = message.channel.alternatives
-    if not alts:
-        return None
-    text = (alts[0].transcript or "").strip()
-    if not text:
-        return None
-    is_final = bool(message.is_final)
-    return text, is_final
-
-
 def _prerecorded_transcript(resp: ListenV1Response) -> str:
     chans = resp.results.channels
     if not chans:
@@ -111,25 +166,52 @@ def _prerecorded_transcript(resp: ListenV1Response) -> str:
 
 
 class _DeepgramStreamRunner:
-    """Un hilo por conexión live: ``start_listening`` bloquea; ``send_media`` desde otros hilos."""
+    """Cliente WebSocket directo a Deepgram (sin SDK, async client en hilo dedicado).
+
+    Por qué async dentro de un hilo en vez de SDK o cliente sync:
+      - SDK 7.x → HTTP 408 en esta red (transport interno).
+      - websockets.sync.client → HTTP 408 en esta red (mismo IP, misma key).
+      - websockets.asyncio.client → HTTP 101 OK (verificado).
+
+    El middlebox que se mete entre el equipo y Deepgram marca como request
+    "incompleto" todo lo que no sea async. La hipótesis más probable: el cliente
+    sync mantiene Nagle activado y manda los headers en >1 paquete TCP, que
+    algunos proxies deciden timeoutear. El cliente async escribe distinto.
+
+    Diseño:
+      - Un hilo por runner; el hilo levanta su propio asyncio loop.
+      - Dentro del loop: 1 task que lee del WS, 1 task que vacía la send_queue
+        (bytes desde el thread del FastAPI), 1 task que vigila stop_event.
+      - send() es 100% thread-safe: solo encola bytes.
+
+    Protocolo Deepgram live:
+      - Auth: header ``Authorization: Token <key>`` en el handshake.
+      - Frame binario = chunk audio. Texto = JSON {"type":"Results"|...}.
+      - Cierre limpio: ``{"type": "CloseStream"}``.
+    """
+
+    DG_HOST = "api.deepgram.com"
+    DG_WSS_PATH = "/v1/listen"
 
     def __init__(
         self,
         *,
-        dg_client: DeepgramClient,
-        listen_kwargs: dict[str, Any],
+        api_key: str,
+        listen_params: dict[str, str],
         loop: asyncio.AbstractEventLoop,
         transcript_queue: asyncio.Queue,
         on_error: Callable[[str], None] | None,
         name: str,
     ) -> None:
-        self._client = dg_client
-        self._listen_kwargs = listen_kwargs
+        self._api_key = api_key
+        self._listen_params = listen_params
         self._loop = loop
         self._queue = transcript_queue
         self._on_error = on_error
         self._name = name
-        self._conn_holder: dict[str, Any] = {"conn": None}
+        # connected_event marca "handshake ok"; usado por start() para esperar.
+        self._connected = threading.Event()
+        self._send_q: queue_mod.Queue[bytes | None] = queue_mod.Queue()
         self._thread: threading.Thread | None = None
         self._stopped = threading.Event()
         self._started = False
@@ -141,42 +223,163 @@ class _DeepgramStreamRunner:
             self._loop,
         )
 
-    def _worker(self) -> None:
+    def _build_url(self) -> str:
+        return f"wss://{self.DG_HOST}{self.DG_WSS_PATH}?{urlencode(self._listen_params)}"
+
+    def _process_text_message(self, raw: str) -> None:
         try:
-            with self._client.listen.v1.connect(**self._listen_kwargs) as connection:
-                self._conn_holder["conn"] = connection
+            msg = json.loads(raw)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(msg, dict):
+            return
+        if msg.get("type") != "Results":
+            return
+        try:
+            channel = msg.get("channel") or {}
+            alts = channel.get("alternatives") or []
+            if not alts:
+                return
+            text = (alts[0].get("transcript") or "").strip()
+        except (AttributeError, IndexError, TypeError):
+            return
+        if not text:
+            return
+        if _is_spurious_transcript(text):
+            logger.debug("Deepgram [%s] dropped spurious: %r", self._name, text[:80])
+            return
+        self._emit(text, bool(msg.get("is_final", False)))
 
-                def on_message(message: Any, **_kwargs: Any) -> None:
-                    parsed = _results_to_text(message)
-                    if not parsed:
-                        return
-                    text, is_final = parsed
-                    if _is_spurious_transcript(text):
-                        logger.debug(
-                            "Deepgram [%s] dropped spurious: %r", self._name, text[:80]
-                        )
-                        return
-                    self._emit(text, is_final)
+    async def _pump_send(self, ws: Any) -> None:
+        """Drena send_q hacia el WS hasta que llegue None o se cierre."""
+        loop = asyncio.get_running_loop()
+        while not self._stopped.is_set():
+            chunk = await loop.run_in_executor(None, self._send_q.get)
+            if chunk is None:
+                return
+            try:
+                await ws.send(chunk)
+            except ConnectionClosed:
+                return
+            except Exception as e:
+                logger.warning("Deepgram [%s] send failed: %s", self._name, e)
+                return
 
-                def on_err(exc: Any, **_kwargs: Any) -> None:
-                    logger.exception("Deepgram [%s] socket error: %s", self._name, exc)
-                    if self._on_error:
-                        self._on_error(f"{self._name}: {exc!s}")
+    async def _pump_recv(self, ws: Any) -> None:
+        try:
+            async for raw in ws:
+                if self._stopped.is_set():
+                    return
+                if isinstance(raw, bytes):
+                    continue
+                self._process_text_message(raw)
+        except ConnectionClosed as e:
+            logger.info("Deepgram [%s] conexión cerrada: %s", self._name, e)
 
-                connection.on(EventType.MESSAGE, on_message)
-                connection.on(EventType.ERROR, on_err)
-                connection.start_listening()
-        except InvalidStatus as e:
-            msg = _handshake_failure_message(e)
-            logger.error("Deepgram [%s] handshake rejected: %s", self._name, msg)
+    async def _wait_stop(self) -> None:
+        while not self._stopped.is_set():
+            await asyncio.sleep(0.1)
+
+    async def _run_one_session(self) -> None:
+        """Un intento de handshake + ciclo recv/send. Lanza la excepción al caller."""
+        url = self._build_url()
+        headers = [("Authorization", f"Token {self._api_key}")]
+        async with ws_async_connect(
+            url,
+            additional_headers=headers,
+            user_agent_header="signalcard-backend/1.0 websockets",
+            open_timeout=15.0,
+            max_size=2**24,
+        ) as ws:
+            self._connected.set()
+            logger.info("Deepgram [%s] WSS conectado (HTTP 101); escuchando", self._name)
+            send_task = asyncio.create_task(self._pump_send(ws))
+            recv_task = asyncio.create_task(self._pump_recv(ws))
+            stop_task = asyncio.create_task(self._wait_stop())
+            try:
+                _done, pending = await asyncio.wait(
+                    {send_task, recv_task, stop_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for t in pending:
+                    t.cancel()
+                for t in pending:
+                    try:
+                        await t
+                    except (asyncio.CancelledError, Exception):
+                        pass
+            finally:
+                try:
+                    await asyncio.wait_for(
+                        ws.send(json.dumps({"type": "CloseStream"})), timeout=2.0
+                    )
+                except Exception as e:
+                    logger.debug("CloseStream [%s] envio: %s", self._name, e)
+
+    async def _async_lifecycle(self) -> None:
+        retryable_statuses = {408, 502, 503, 504}
+        max_attempts = 3
+        backoff_seconds = 2.0
+        last_exc: BaseException | None = None
+
+        for attempt in range(1, max_attempts + 1):
+            if self._stopped.is_set():
+                return
+            try:
+                await self._run_one_session()
+                return
+            except InvalidStatus as e:
+                last_exc = e
+                status = e.response.status_code
+                if status in retryable_statuses and attempt < max_attempts:
+                    ip = _resolve_host("api.deepgram.com")
+                    logger.warning(
+                        "Deepgram [%s] handshake intento %d/%d -> HTTP %s (DNS ahora -> %s); reintentando en %.1fs",
+                        self._name, attempt, max_attempts, status, ip, backoff_seconds,
+                    )
+                    await asyncio.sleep(backoff_seconds)
+                    continue
+                break
+            except Exception as e:
+                last_exc = e
+                break
+
+        if last_exc is None:
+            return
+        if isinstance(last_exc, InvalidStatus):
+            msg = _handshake_failure_message(last_exc)
+            r = last_exc.response
+            logger.error(
+                "Deepgram [%s] handshake rejected tras %d intentos: %s | status=%s headers=%s",
+                self._name,
+                max_attempts,
+                msg,
+                r.status_code,
+                dict(r.headers),
+            )
             if self._on_error:
                 self._on_error(f"deepgram_handshake [{self._name}]: {msg}")
-        except Exception as e:
-            logger.exception("Deepgram [%s] session failed: %s", self._name, e)
+        else:
+            logger.error(
+                "Deepgram [%s] session failed: type=%s args=%r\n%s",
+                self._name,
+                type(last_exc).__name__,
+                getattr(last_exc, "args", ()),
+                "".join(traceback.format_exception(type(last_exc), last_exc, last_exc.__traceback__))[-2000:],
+            )
             if self._on_error:
-                self._on_error(f"{self._name}: {e!s}")
+                self._on_error(f"{self._name}: {type(last_exc).__name__}: {last_exc!s}")
+
+    def _worker(self) -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(self._async_lifecycle())
         finally:
-            self._conn_holder["conn"] = None
+            try:
+                loop.close()
+            except Exception:
+                pass
 
     def start(self) -> None:
         with self._start_lock:
@@ -187,38 +390,28 @@ class _DeepgramStreamRunner:
                 target=self._worker, name=f"deepgram-{self._name}", daemon=True
             )
             self._thread.start()
-            deadline = time.monotonic() + 15.0
-            while time.monotonic() < deadline:
-                if self._conn_holder["conn"] is not None:
-                    return
-                if self._stopped.is_set():
-                    return
-                time.sleep(0.05)
+            # Cubre 3 intentos de handshake + backoff (ver _async_lifecycle).
+            if self._connected.wait(timeout=25.0):
+                return
+            if self._stopped.is_set():
+                return
             logger.warning(
                 "Deepgram [%s] connection not ready after wait; audio may drop briefly",
                 self._name,
             )
 
     def send(self, chunk: bytes) -> None:
-        conn = self._conn_holder["conn"]
-        if conn is None or not chunk:
+        if not chunk or self._stopped.is_set():
             return
-        try:
-            conn.send_media(chunk)
-        except Exception as e:
-            logger.warning("Deepgram [%s] send_media failed: %s", self._name, e)
+        # Thread-safe: el _pump_send dentro del loop async del worker hará el await ws.send().
+        self._send_q.put(chunk)
 
     def stop(self) -> None:
         self._stopped.set()
-        conn = self._conn_holder["conn"]
-        if conn is not None:
-            try:
-                conn.send_close_stream()
-            except Exception as e:
-                logger.debug("send_close_stream [%s]: %s", self._name, e)
+        # Sentinel: desbloquea _pump_send si está esperando en queue.get().
+        self._send_q.put(None)
         if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=8.0)
-        self._conn_holder["conn"] = None
+            self._thread.join(timeout=10.0)
 
 
 class DeepgramStreamSession:
@@ -234,17 +427,18 @@ class DeepgramStreamSession:
         key = _normalize_deepgram_key(api_key)
         if not key:
             raise ValueError("Configure DEEPGRAM_API_KEY")
-        # Cliente por defecto del SDK (mismo handshake que documentación oficial).
-        # transport_factory+custom websockets rompía el patrón ``with connect()`` en
-        # algunas versiones y puede alterar extensiones/handshake frente a Deepgram.
-        self._client = DeepgramClient(api_key=key)
+        _log_environment_diagnostics()
+        # NO usamos DeepgramClient para WSS — su transport interno provoca HTTP 408
+        # en algunas redes (ver _DeepgramStreamRunner). Hablamos el protocolo directo
+        # con websockets plano. El SDK queda solo para REST/prerecorded.
+        self._api_key = key
         self._loop = loop
         self._queue = transcript_queue
         self._on_error = on_error
         self._settings = get_settings()
         model = (self._settings.deepgram_model or "").strip() or "nova-2"
-        # Deepgram: en query string usar "true"/"false" minúsculas, no bool Python.
-        self._listen_kw: dict[str, Any] = {
+        # Query params de Deepgram: strings "true"/"false" minúsculas, no bool Python.
+        self._listen_params: dict[str, str] = {
             "model": model,
             "interim_results": "true",
             "smart_format": "true",
@@ -258,8 +452,8 @@ class DeepgramStreamSession:
 
     def _build_runner(self, name: str) -> _DeepgramStreamRunner:
         return _DeepgramStreamRunner(
-            dg_client=self._client,
-            listen_kwargs=self._listen_kw,
+            api_key=self._api_key,
+            listen_params=self._listen_params,
             loop=self._loop,
             transcript_queue=self._queue,
             on_error=self._on_error,
