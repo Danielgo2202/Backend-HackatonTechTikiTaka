@@ -12,5 +12,35 @@
   ],
   "suggested_response": "Apollo ayuda a abrir puertas; SignalCard ayuda a cerrar cuando el competidor sale en la mesa.",
   "recommended_question": "¿Dónde están perdiendo más deals hoy: en el primer contacto o en las objeciones en vivo?",
-  "key_differentiator": "Detección de competidor en la llamada + battlecard lista para responder al instante."
+  "key_differentiator": "Detección de competidor en la llamada + battlecard lista para responder al instante.",
+  "metrics": {
+    "win_rate_vs_competitor": 72,
+    "avg_deal_cycle_days": 31,
+    "deals_won_last_quarter": 18,
+    "deals_lost_last_quarter": 7,
+    "risk_level": "bajo",
+    "top_objection": "Ya pagamos Apollo para outbound"
+  },
+  "chart_data": {
+    "win_loss_trend": [
+      { "month": "Ene", "won": 3, "lost": 2 },
+      { "month": "Feb", "won": 4, "lost": 1 },
+      { "month": "Mar", "won": 3, "lost": 2 },
+      { "month": "Abr", "won": 5, "lost": 1 },
+      { "month": "May", "won": 6, "lost": 1 }
+    ],
+    "feature_comparison": [
+      { "feature": "Live battlecards", "nosotros": 100, "competidor": 10 },
+      { "feature": "Base de contactos", "nosotros": 40, "competidor": 95 },
+      { "feature": "Secuencias outbound", "nosotros": 35, "competidor": 90 },
+      { "feature": "Coaching en vivo", "nosotros": 95, "competidor": 15 },
+      { "feature": "Precio", "nosotros": 80, "competidor": 85 }
+    ],
+    "objection_frequency": [
+      { "objection": "Solapamiento outbound", "count": 6 },
+      { "objection": "Presupuesto", "count": 4 },
+      { "objection": "Datos de contacto", "count": 3 },
+      { "objection": "Adopción del equipo", "count": 2 }
+    ]
+  }
 }
