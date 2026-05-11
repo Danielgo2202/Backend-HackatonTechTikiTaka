@@ -11,7 +11,7 @@ from typing import Any
 
 from langchain_chroma import Chroma
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
+from langchain_groq import ChatGroq
 
 from config import Settings, get_settings
 from schemas import BattlecardEvent, battlecard_from_dict
@@ -100,24 +100,27 @@ def _format_with_llm(
     client_context: dict[str, Any] | None,
     settings: Settings,
 ) -> dict[str, Any]:
-    if not settings.openai_api_key:
+    if not settings.groq_api_key:
         return card
 
-    llm = ChatOpenAI(
-        api_key=settings.openai_api_key,
-        model=settings.llm_model,
+    llm = ChatGroq(
+        api_key=settings.groq_api_key,
+        model=settings.llm_model,  # ej. llama-3.3-70b-versatile
         temperature=0.2,
     )
     sys = (
-        "Eres un asistente de ventas. Recibes una battlecard en JSON y opcionalmente "
-        "contexto del cliente. Devuelve SOLO un JSON válido con las claves: "
-        "key_differentiator, suggested_response, recommended_question, weaknesses (array de strings cortos). "
+        "Eres un asistente de ventas. Recibes una battlecard de un competidor en JSON y opcionalmente "
+        "contexto del cliente. Devuelve SOLO un JSON válido, teniendo en cuenta "
+        "la debilidades del competidor y los pain points del cliente, el JSON debe tener las siguientes claves:"
+        "key_differentiator (string corto y conciso, no más de 80 caracteres), suggested_response (string corto y conciso, no más de 80 caracteres), "
+        "recommended_question (string corto y conciso, no más de 80 caracteres), weaknesses (array de strings cortos y concisos, no más de 80 caracteres)."
         "Mantén tono profesional en español. No agregues texto fuera del JSON."
     )
     human = json.dumps(
         {"battlecard": card, "client_context": client_context or {}},
         ensure_ascii=False,
     )
+    logger.info(f"LLM context: {human}")
     msg = llm.invoke([SystemMessage(content=sys), HumanMessage(content=human)])
     content = msg.content if isinstance(msg.content, str) else str(msg.content)
     try:

@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     )
 
     openai_api_key: str | None = None
+    groq_api_key: str | None = None
     deepgram_api_key: str | None = None
     deepgram_model: str = "nova-2"
 
@@ -38,7 +39,7 @@ class Settings(BaseSettings):
     chroma_persist_dir: str = str(Path(__file__).resolve().parent / "chroma_db")
     battlecards_dir: str = str(Path(__file__).resolve().parent / "battlecards")
 
-    llm_model: str = "gpt-4o-mini"
+    llm_model: str = "llama-3.1-8b-instant"
     embedding_model: str = "all-MiniLM-L6-v2"
 
     mock_transcription: bool = False
