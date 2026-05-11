@@ -1,11 +1,12 @@
 # Nixpacks build config para Railway.
-# La versión de Python la fija runtime.txt (3.12.8 actualmente).
-# Solo añadimos gcc para compilar paquetes nativos que aún no tienen wheel.
-#
 # Este archivo vive en backend/ porque Railway tiene Root Directory = "backend".
+#
+# nixPkgs OBLIGATORIO incluye python (no solo gcc): al sobrescribir [phases.setup]
+# perdemos el python que Nixpacks añade por default y el install phase falla con
+# "python: command not found". python312 alinea con runtime.txt (3.12.8).
 
 [phases.setup]
-nixPkgs = ['gcc']
+nixPkgs = ['python312', 'gcc']
 
 [phases.install]
 cmds = ['python -m pip install --upgrade pip', 'pip install --no-cache-dir -r requirements.txt']
