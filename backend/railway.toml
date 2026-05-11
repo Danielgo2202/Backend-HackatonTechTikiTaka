@@ -1,5 +1,7 @@
-# Railway deployment config — el backend vive en backend/, no en la raíz.
-# Sin este archivo, Nixpacks no sabe entrar al subdirectorio y arranca lo que adivina.
+# Railway deployment config.
+# Este archivo vive en backend/ porque el servicio en Railway tiene
+#   Settings -> Service -> Root Directory = "backend"
+# Railway lee railway.toml desde el Root Directory, no desde la raíz del repo.
 
 [build]
 builder = "nixpacks"
@@ -11,7 +13,7 @@ builder = "nixpacks"
 #   corta conexiones idle ~60-90s sin keepalive).
 # - --timeout-keep-alive 65 cubre el tiempo de keepalive de Railway (60s).
 # Si cambias estos flags, vuelve a verificar wss:// desde el FE.
-startCommand = "cd backend && uvicorn main:app --host 0.0.0.0 --port $PORT --proxy-headers --forwarded-allow-ips=* --ws-ping-interval 20 --ws-ping-timeout 30 --timeout-keep-alive 65"
+startCommand = "uvicorn main:app --host 0.0.0.0 --port $PORT --proxy-headers --forwarded-allow-ips=* --ws-ping-interval 20 --ws-ping-timeout 30 --timeout-keep-alive 65"
 
 # /healthz responde 200 SIEMPRE (sin tocar app.state) — el cold start tarda
 # minutos descargando el modelo HuggingFace y /health real podría tardar.

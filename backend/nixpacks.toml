@@ -1,0 +1,14 @@
+# Nixpacks build config para Railway.
+# La versión de Python la fija runtime.txt (3.12.8 actualmente).
+# Solo añadimos gcc para compilar paquetes nativos que aún no tienen wheel.
+#
+# Este archivo vive en backend/ porque Railway tiene Root Directory = "backend".
+
+[phases.setup]
+nixPkgs = ['gcc']
+
+[phases.install]
+cmds = ['python -m pip install --upgrade pip', 'pip install --no-cache-dir -r requirements.txt']
+
+[start]
+cmd = 'uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080} --proxy-headers --forwarded-allow-ips=* --ws-ping-interval 20 --ws-ping-timeout 30 --timeout-keep-alive 65'
